@@ -26,6 +26,9 @@ public class UnrealAgentTest : ModuleRules
 			new string[]
 			{
 				"Core",
+				"InputCore",
+				"Json",
+				"JsonUtilities",
 				// ... add other public dependencies that you statically link with here ...
 			}
 			);
@@ -36,6 +39,7 @@ public class UnrealAgentTest : ModuleRules
 			{
 				"CoreUObject",
 				"Engine",
+				"HTTPServer",
 				"Slate",
 				"SlateCore",
 				// ... add private dependencies that you statically link with here ...	

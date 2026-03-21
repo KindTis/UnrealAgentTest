@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Modules/ModuleManager.h"
 
+class FGameTestRemoteServer;
 struct FActorsInitializedParams;
 
 class FUnrealAgentTestModule : public IModuleInterface
@@ -16,7 +17,10 @@ public:
 	virtual void ShutdownModule() override;
 
 private:
+	bool ShouldEnableRemoteServer() const;
+	uint16 ResolveRemoteServerPort() const;
 	void HandleWorldInitializedActors(const FActorsInitializedParams& InParams);
 
 	FDelegateHandle WorldInitializedActorsDelegateHandle;
+	TUniquePtr<FGameTestRemoteServer> RemoteServer;
 };

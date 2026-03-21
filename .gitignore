@@ -80,3 +80,7 @@ AGENTS.md
 *_Plan.md
 *_Context.md
 *_CheckList.md
+
+# Python cache files
+__pycache__/
+*.py[cod]

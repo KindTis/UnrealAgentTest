@@ -73,3 +73,10 @@ Plugins/**/Intermediate/*
 
 # Cache files for the editor to use
 DerivedDataCache/*
+
+# AI Agent docs
+AGENTS.md
+*_Spec.md
+*_Plan.md
+*_Context.md
+*_CheckList.md

@@ -306,7 +306,7 @@ class UnrealTestClient:
             payload["trace_id"] = trace_id
         if args is not None:
             payload["args"] = dict(args)
-        return self._request("POST", "/command/execute", json_body=payload)
+        return self._request("POST", "/command/execute", json_body=payload, allow_http_error_json=True)
 
     def get_player_state(
         self,
@@ -572,6 +572,7 @@ class UnrealTestClient:
         *,
         query: Optional[Mapping[str, str]] = None,
         json_body: Optional[Mapping[str, Any]] = None,
+        allow_http_error_json: bool = False,
     ) -> JsonObject:
         url = self._build_url(path, query=query)
         body_bytes = None
@@ -592,7 +593,28 @@ class UnrealTestClient:
                     return json.loads(payload)
             except error.HTTPError as exc:
                 last_error = exc
+                body_text = ""
+                parsed_body: Optional[JsonObject] = None
+                try:
+                    body_text = exc.read().decode("utf-8", errors="replace")
+                    if body_text.strip():
+                        parsed = json.loads(body_text)
+                        if isinstance(parsed, dict):
+                            parsed_body = parsed
+                except Exception:  # noqa: BLE001
+                    pass
+
+                if allow_http_error_json and parsed_body is not None:
+                    return parsed_body
+
                 if exc.code < 500 and exc.code != 429:
+                    body_summary = body_text.strip().replace("\r", " ").replace("\n", " ")
+                    if len(body_summary) > 300:
+                        body_summary = f"{body_summary[:300]}..."
+                    if body_summary:
+                        raise UnrealTestClientError(
+                            f"HTTP {exc.code} calling {method} {path}: {exc.reason} | body={body_summary}"
+                        ) from exc
                     raise UnrealTestClientError(f"HTTP {exc.code} calling {method} {path}: {exc.reason}") from exc
             except (error.URLError, TimeoutError, json.JSONDecodeError) as exc:
                 last_error = exc

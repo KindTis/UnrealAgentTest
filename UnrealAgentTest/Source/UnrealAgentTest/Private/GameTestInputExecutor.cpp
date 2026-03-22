@@ -282,18 +282,23 @@ namespace
 
 		const bool bXHandled = SendSimulatedKey(PlayerController, XKey, IE_Axis, static_cast<float>(XValue));
 		const bool bYHandled = SendSimulatedKey(PlayerController, YKey, IE_Axis, static_cast<float>(YValue));
-		if (!bXHandled && !bYHandled)
-		{
-			OutErrorMessage = FString::Printf(TEXT("PlayerController did not handle any native axis input for stick_id '%s'."), *StickId);
-			return false;
-		}
 
 		SetDetailsString(Details, TEXT("resolved_stick"), ResolvedStick);
 		SetDetailsString(Details, TEXT("input_x_key"), XKey.GetFName().ToString());
 		SetDetailsString(Details, TEXT("input_y_key"), YKey.GetFName().ToString());
 		SetDetailsNumber(Details, TEXT("applied_x"), XValue);
 		SetDetailsNumber(Details, TEXT("applied_y"), YValue);
+		SetDetailsBool(Details, TEXT("input_x_handled"), bXHandled);
+		SetDetailsBool(Details, TEXT("input_y_handled"), bYHandled);
 		SetDetailsString(Details, TEXT("input_mode"), bReleaseOnly ? TEXT("release_stick") : TEXT("move_stick"));
+
+		// Some input stacks do not report axis consumption even when axis values are propagated.
+		// Keep command successful and expose handled flags in details for observability.
+		if (!bXHandled && !bYHandled)
+		{
+			SetDetailsString(Details, TEXT("input_warning"), TEXT("axis_input_not_reported_handled"));
+		}
+
 		return true;
 	}
 

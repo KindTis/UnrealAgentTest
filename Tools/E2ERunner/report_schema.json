@@ -1,0 +1,399 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://unreal-agent-test.local/schemas/e2e-runner-report.schema.json",
+  "title": "UnrealAgentTest E2E Runner Report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ok",
+    "run_id",
+    "session_id",
+    "mode",
+    "scenario",
+    "base_url",
+    "started_at_utc",
+    "ended_at_utc",
+    "duration_seconds",
+    "launch",
+    "checks",
+    "artifacts",
+    "artifacts_root",
+    "report_path",
+    "steps",
+    "success",
+    "failure",
+    "capabilities",
+    "final_state",
+    "notes"
+  ],
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "launch",
+        "attach"
+      ]
+    },
+    "scenario": {
+      "type": "string",
+      "minLength": 1
+    },
+    "base_url": {
+      "type": "string",
+      "minLength": 1
+    },
+    "started_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "ended_at_utc": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "duration_seconds": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "launch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "mode"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "launch",
+            "attach"
+          ]
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "log_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "termination": {
+          "type": "string",
+          "enum": [
+            "already-exited",
+            "terminate",
+            "kill"
+          ]
+        },
+        "termination_error": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "health",
+        "capabilities",
+        "session_start",
+        "equip",
+        "approach",
+        "attack",
+        "session_stop"
+      ],
+      "properties": {
+        "health": {
+          "type": "boolean"
+        },
+        "capabilities": {
+          "type": "boolean"
+        },
+        "session_start": {
+          "type": "boolean"
+        },
+        "equip": {
+          "type": "boolean"
+        },
+        "approach": {
+          "type": "boolean"
+        },
+        "attack": {
+          "type": "boolean"
+        },
+        "session_stop": {
+          "type": "boolean"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root",
+        "report_path"
+      ],
+      "properties": {
+        "root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "report_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "log_path": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "artifacts_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "report_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "command",
+          "request_args",
+          "status",
+          "started_at_utc",
+          "ended_at_utc",
+          "duration_seconds",
+          "response",
+          "observation",
+          "failure"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "request_args": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "running",
+              "passed",
+              "skipped",
+              "failed"
+            ]
+          },
+          "started_at_utc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ended_at_utc": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "duration_seconds": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "response": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          },
+          "observation": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "stage",
+                  "code",
+                  "message"
+                ],
+                "properties": {
+                  "stage": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "code": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "details": {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_alive",
+        "actor_died_event_detected",
+        "success_condition"
+      ],
+      "properties": {
+        "target_alive": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "actor_died_event_detected": {
+          "type": "boolean"
+        },
+        "success_condition": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      }
+    },
+    "failure": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stage",
+            "code",
+            "message"
+          ],
+          "properties": {
+            "stage": {
+              "type": "string",
+              "minLength": 1
+            },
+            "code": {
+              "type": "string",
+              "minLength": 1
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1
+            },
+            "details": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        }
+      ]
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "events_websocket_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "events_websocket_port": {
+          "type": [
+            "integer",
+            "number",
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "final_state": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "session_start": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "session_stop": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "session_stop_cleanup": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

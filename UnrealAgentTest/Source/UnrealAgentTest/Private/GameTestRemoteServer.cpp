@@ -635,7 +635,14 @@ void FGameTestRemoteServer::Stop()
 
 	if (bRunning)
 	{
-		FHttpServerModule::Get().StopAllListeners();
+		if (FHttpServerModule* HttpServerModule = FModuleManager::GetModulePtr<FHttpServerModule>(TEXT("HTTPServer")))
+		{
+			HttpServerModule->StopAllListeners();
+		}
+		else
+		{
+			UE_LOG(LogGameTestRemoteServer, Verbose, TEXT("HTTPServer module already unloaded. Skip StopAllListeners during shutdown."));
+		}
 	}
 
 	bRunning = false;

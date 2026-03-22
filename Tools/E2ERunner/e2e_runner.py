@@ -23,6 +23,8 @@ from Tools.ParallelRunner.parallel_runner import (  # noqa: E402
     utc_now_iso,
 )
 from Tools.E2ERunner.scenario_schema import (  # noqa: E402
+    SUPPORTED_DEFEAT_INTENT,
+    SUPPORTED_MOVEMENT_INTENT,
     TERMINATION_MODES,
     validate_scenario,
 )
@@ -354,6 +356,233 @@ def _send_command(
     raise E2ERunnerError(f"{command} command response is not a JSON object.")
 
 
+def _run_movement_jump_sequence(
+    client: UnrealTestClient,
+    result: Dict[str, Any],
+    *,
+    session_id: str,
+    scenario_definition: Mapping[str, Any],
+    poll_interval: float,
+) -> None:
+    sequence = scenario_definition.get("sequence", {})
+    success_criteria = scenario_definition.get("success_criteria", {})
+    failure_criteria = scenario_definition.get("failure_criteria", {})
+    if not isinstance(sequence, Mapping):
+        raise E2ERunnerError("scenario.sequence must be an object.")
+
+    timeout_seconds = _safe_float(
+        success_criteria.get("timeout_seconds") if isinstance(success_criteria, Mapping) else None,
+        15.0,
+    )
+    input_failure_limit = _safe_int(
+        failure_criteria.get("input_failure_limit") if isinstance(failure_criteria, Mapping) else None,
+        3,
+    )
+    camera_lock_stick_id = str(sequence.get("camera_lock_stick_id", "right_stick")).strip() or "right_stick"
+    move_stick_id = str(sequence.get("move_stick_id", "left_stick")).strip() or "left_stick"
+    jump_button_id = str(sequence.get("jump_button_id", "jump")).strip() or "jump"
+    forward_seconds = _safe_float(sequence.get("forward_seconds"), 2.0)
+    backward_seconds = _safe_float(sequence.get("backward_seconds"), 2.0)
+    move_x = _safe_float(sequence.get("move_x"), 0.0)
+    forward_y = _safe_float(sequence.get("forward_y"), 1.0)
+    backward_y = _safe_float(sequence.get("backward_y"), -1.0)
+    pulse_interval_seconds = _safe_float(sequence.get("pulse_interval_seconds"), 0.1)
+    pulse_interval_seconds = max(0.05, min(1.0, pulse_interval_seconds))
+    pulse_duration_ms = max(50, int(round(pulse_interval_seconds * 1000.0)))
+    jump_duration_ms = max(50, _safe_int(sequence.get("jump_duration_ms"), 120))
+    jump_settle_seconds = max(0.0, _safe_float(sequence.get("jump_settle_seconds"), 0.2))
+
+    step = _create_step_record(
+        "movement_jump_sequence",
+        command="sequence_execute",
+        request_args={
+            "camera_lock_stick_id": camera_lock_stick_id,
+            "move_stick_id": move_stick_id,
+            "jump_button_id": jump_button_id,
+            "forward_seconds": forward_seconds,
+            "backward_seconds": backward_seconds,
+            "move_x": move_x,
+            "forward_y": forward_y,
+            "backward_y": backward_y,
+            "pulse_interval_seconds": pulse_interval_seconds,
+        },
+    )
+    result["steps"].append(step)
+    step_started_at_monotonic = time.monotonic()
+    deadline = step_started_at_monotonic + max(1.0, timeout_seconds)
+    command_log: list[Dict[str, Any]] = []
+    consecutive_input_failures = 0
+
+    observation: Dict[str, Any] = {
+        "command_log": command_log,
+        "timeout_seconds": timeout_seconds,
+        "input_failure_limit": input_failure_limit,
+        "sequence": {
+            "camera_lock_stick_id": camera_lock_stick_id,
+            "move_stick_id": move_stick_id,
+            "jump_button_id": jump_button_id,
+            "forward_seconds": forward_seconds,
+            "backward_seconds": backward_seconds,
+        },
+    }
+
+    def _fail_sequence(
+        code: str,
+        message: str,
+        *,
+        details: Optional[Mapping[str, Any]] = None,
+        response: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        failure = _make_failure("movement_jump_sequence", code, message, details=details)
+        _finalize_step_record(
+            step,
+            status="failed",
+            response=response,
+            observation=observation,
+            failure=failure,
+            started_at_monotonic=step_started_at_monotonic,
+        )
+        raise E2ERunnerError(message)
+
+    def _check_timeout() -> None:
+        if time.monotonic() >= deadline:
+            _fail_sequence(
+                "overall_timeout",
+                f"Movement jump sequence exceeded timeout ({timeout_seconds} seconds).",
+                details={"timeout_seconds": timeout_seconds},
+            )
+
+    def _send_sequence_command(name: str, command: str, request_args: Mapping[str, Any]) -> bool:
+        nonlocal consecutive_input_failures
+        _check_timeout()
+        started_at = time.monotonic()
+        response = _send_command(client, session_id=session_id, command=command, request_args=request_args)
+        accepted = bool(response.get("accepted", False))
+        record: Dict[str, Any] = {
+            "name": name,
+            "command": command,
+            "request_args": dict(request_args),
+            "accepted": accepted,
+            "error_code": response.get("error_code"),
+            "error_message": response.get("error_message"),
+            "duration_seconds": round(max(0.0, time.monotonic() - started_at), 3),
+        }
+        details = response.get("details")
+        if isinstance(details, Mapping):
+            input_execution = details.get("input_execution")
+            if isinstance(input_execution, Mapping):
+                if "input_key" in input_execution:
+                    record["input_key"] = input_execution.get("input_key")
+                if "input_mode" in input_execution:
+                    record["input_mode"] = input_execution.get("input_mode")
+                if "tap_duration_ms" in input_execution:
+                    record["tap_duration_ms"] = input_execution.get("tap_duration_ms")
+                if "can_jump_before" in input_execution:
+                    record["can_jump_before"] = input_execution.get("can_jump_before")
+                if "release_scheduled" in input_execution:
+                    record["release_scheduled"] = input_execution.get("release_scheduled")
+                if "release_delay_seconds" in input_execution:
+                    record["release_delay_seconds"] = input_execution.get("release_delay_seconds")
+        command_log.append(record)
+
+        if accepted:
+            consecutive_input_failures = 0
+            return True
+
+        error_code = str(response.get("error_code", "command_rejected"))
+        if error_code == "input_execution_failed":
+            consecutive_input_failures += 1
+            if consecutive_input_failures < max(1, input_failure_limit):
+                return False
+            _fail_sequence(
+                "input_execution_failed_limit",
+                "Sequence failed repeatedly due to input execution errors.",
+                details={
+                    "input_failure_limit": input_failure_limit,
+                    "last_error_message": response.get("error_message"),
+                },
+                response=response,
+            )
+
+        _fail_sequence(
+            error_code,
+            str(response.get("error_message", f"{name} command was rejected.")),
+            details={"error_stage": response.get("error_stage")},
+            response=response,
+        )
+
+    def _send_with_retry(name: str, command: str, request_args: Mapping[str, Any]) -> None:
+        attempts = 0
+        max_attempts = max(1, input_failure_limit)
+        while attempts < max_attempts:
+            attempts += 1
+            accepted = _send_sequence_command(f"{name}_attempt_{attempts}", command, request_args)
+            if accepted:
+                return
+            time.sleep(max(0.01, min(pulse_interval_seconds, poll_interval if poll_interval > 0 else pulse_interval_seconds)))
+        _fail_sequence(
+            "input_execution_failed_limit",
+            f"{name} command could not be accepted within failure limits.",
+            details={"input_failure_limit": input_failure_limit},
+        )
+
+    def _run_move_phase(phase_name: str, duration_seconds: float, axis_y: float) -> None:
+        phase_started = time.monotonic()
+        pulse_index = 0
+        while (time.monotonic() - phase_started) < duration_seconds:
+            pulse_index += 1
+            accepted = _send_sequence_command(
+                f"{phase_name}_move_{pulse_index}",
+                "move_stick",
+                {
+                    "stick_id": move_stick_id,
+                    "x": move_x,
+                    "y": axis_y,
+                    "duration_ms": pulse_duration_ms,
+                },
+            )
+            if accepted:
+                result["checks"]["approach"] = True
+            time.sleep(max(0.01, min(pulse_interval_seconds, poll_interval if poll_interval > 0 else pulse_interval_seconds)))
+        _send_sequence_command(
+            f"{phase_name}_release",
+            "release_stick",
+            {"stick_id": move_stick_id},
+        )
+
+    _send_with_retry(
+        "camera_lock_center",
+        "move_stick",
+        {"stick_id": camera_lock_stick_id, "x": 0.0, "y": 0.0, "duration_ms": 100},
+    )
+    _send_with_retry("camera_lock_release", "release_stick", {"stick_id": camera_lock_stick_id})
+
+    _run_move_phase("forward", max(0.1, forward_seconds), forward_y)
+
+    jump_accepted = _send_sequence_command(
+        "jump",
+        "tap_button",
+        {"button_id": jump_button_id, "duration_ms": jump_duration_ms},
+    )
+    if not jump_accepted:
+        _send_with_retry("jump_retry", "tap_button", {"button_id": jump_button_id, "duration_ms": jump_duration_ms})
+    if jump_settle_seconds > 0:
+        time.sleep(jump_settle_seconds)
+
+    _run_move_phase("backward", max(0.1, backward_seconds), backward_y)
+
+    final_player_state = client.get_player_state(session_id=session_id)
+    result["final_state"]["player_state"] = dict(final_player_state)
+    result["success"]["success_condition"] = "sequence_completed"
+    result["checks"]["scenario_flow"] = True
+    _finalize_step_record(
+        step,
+        status="passed",
+        observation=observation,
+        started_at_monotonic=step_started_at_monotonic,
+    )
+
+
 def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
     started_at_monotonic = time.monotonic()
     run_id = args.run_id or generate_run_id(prefix="e2e")
@@ -381,6 +610,7 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
             "equip": False,
             "approach": False,
             "attack": False,
+            "scenario_flow": False,
             "session_stop": False,
         },
         "artifacts": {
@@ -413,7 +643,8 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
 
     try:
         scenario_definition, scenario_source = _load_scenario_definition(args, run_dir=run_dir)
-        result["scenario"] = str(scenario_definition.get("intent", args.scenario or "default"))
+        scenario_intent = str(scenario_definition.get("intent", args.scenario or "default")).strip()
+        result["scenario"] = scenario_intent or "default"
         result["notes"].append(f"scenario_source:{scenario_source}")
         result["notes"].append(f"scenario_validated_path:{run_dir / 'scenario.validated.json'}")
 
@@ -472,6 +703,26 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
         result["checks"]["session_start"] = True
 
         cursor = _safe_sequence(client.get_events(session_id=session_id, limit=1).get("last_sequence"), 0)
+
+        if scenario_intent == SUPPORTED_MOVEMENT_INTENT:
+            _run_movement_jump_sequence(
+                client,
+                result,
+                session_id=session_id,
+                scenario_definition=scenario_definition,
+                poll_interval=args.poll_interval,
+            )
+            stop_response = client.stop_session(session_id=session_id)
+            result["session_stop"] = stop_response
+            result["checks"]["session_stop"] = bool(stop_response.get("accepted", False))
+            started_session = False
+            result["ok"] = True
+            return result
+
+        if scenario_intent != SUPPORTED_DEFEAT_INTENT:
+            raise E2ERunnerError(
+                f"Unsupported scenario intent for current runner flow: {scenario_intent}"
+            )
 
         equip_args = {"recipe_id": args.equip_recipe_id}
         weapon_value = scenario_definition.get("weapon")
@@ -751,6 +1002,7 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
             observation=engage_observation,
             started_at_monotonic=engage_started_at_monotonic,
         )
+        result["checks"]["scenario_flow"] = True
 
         stop_response = client.stop_session(session_id=session_id)
         result["session_stop"] = stop_response
@@ -806,7 +1058,7 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the equip-approach-attack-kill E2E scenario.")
+    parser = argparse.ArgumentParser(description="Run validated E2E scenarios against Unreal Test Remote API.")
     parser.add_argument("--base-url", default="http://127.0.0.1:31001", help="Remote API base URL.")
     parser.add_argument("--session-id", default=None, help="Optional explicit session id.")
     parser.add_argument("--run-id", default=None, help="Optional explicit run id.")

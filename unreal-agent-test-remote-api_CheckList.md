@@ -53,6 +53,7 @@
 - [x] `IA-05`: `e2e_runner` 종료 옵션(`keep_running`, `close_game`, `close_editor`) 반영 및 attach 모드 미적용 노트 처리.
 - [x] `IA-05`: `parallel_runner` 병렬 정책 구현(`max_concurrent_sessions=2`, FIFO queue, `queue_wait_timeout=120s`, `session_timeout=180s`, 리소스 가드 기본값 0 비활성).
 - [x] `IA-04`: `e2e_runner`에서 자연어/LLM 컴파일 의존 제거 및 AI Agent 작성 JSON 실행 흐름으로 단순화.
+- [x] `IA-04`: `movement_jump_sequence` intent 추가(카메라 정렬→전진 2초→점프→후진 2초) 및 ThirdPerson 맵 검증용 시나리오 샘플 제공.
 
 ## Validation Status
 - Passed: `ThirdPersonActionEditor Win64 Development` 빌드 성공 (2026-03-22, Loop 6 통합 반영 후).
@@ -76,6 +77,8 @@
 - Passed: `python Tools/E2ERunner/e2e_runner.py --help` (시나리오 JSON 입력 전용 CLI 확인).
 - Passed: `python Tools/ParallelRunner/parallel_runner.py --count 1 --base-port 30000 --artifacts-root .\\Artifacts\\ParallelRunner_Sample` (`policy` 블록 출력 확인).
 - Passed: `python Tools/E2ERunner/e2e_runner.py --base-url http://127.0.0.1:39999 --scenario-file .\\Artifacts\\E2ERunner\\sample_scenario.json --health-timeout 0.2 --poll-interval 0.05` (attach 경로 JSON 입력/검증 후 헬스체크 타임아웃 정상 실패 확인, run_id=`e2e-20260322T052640Z-44b1`).
+- Passed: `python Tools/E2ERunner/e2e_runner.py --base-url http://127.0.0.1:39999 --scenario-file Tools/E2ERunner/sample_movement_jump_scenario.json --health-timeout 0.2 --poll-interval 0.05` (`movement_jump_sequence` 스키마 검증 및 attach 경로 헬스체크 타임아웃 정상 실패 확인, run_id=`e2e-20260322T054155Z-4a97`).
+- Passed: `python Tools/E2ERunner/e2e_runner.py --base-url http://127.0.0.1:39999 --scenario-file Tools/E2ERunner/sample_defeat_monster_scenario.json --health-timeout 0.2 --poll-interval 0.05` (`defeat_monster` 회귀 검증, run_id=`e2e-20260322T054155Z-ffb6`).
 
 ## Deferred / Out of Scope
 - [ ] Shipping 빌드 상시 활성화 원격 제어 기능.

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "source_text": "카메라를 정면으로 고정하고, 정면으로 2초 이동 후 점프하고, 뒤로 2초 이동한다.",
+  "language": "ko",
+  "intent": "movement_jump_sequence",
+  "sequence": {
+    "camera_lock_stick_id": "right_stick",
+    "move_stick_id": "left_stick",
+    "forward_seconds": 2.0,
+    "backward_seconds": 2.0,
+    "jump_button_id": "jump",
+    "jump_duration_ms": 220,
+    "jump_settle_seconds": 1.0,
+    "move_x": 0.0,
+    "forward_y": 1.0,
+    "backward_y": -1.0,
+    "pulse_interval_seconds": 0.1
+  },
+  "success_criteria": {
+    "timeout_seconds": 20,
+    "completion_state": "sequence_completed"
+  },
+  "failure_criteria": {
+    "input_failure_limit": 3
+  },
+  "termination": {
+    "mode": "keep_running"
+  }
+}

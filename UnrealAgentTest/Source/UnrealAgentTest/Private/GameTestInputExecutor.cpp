@@ -1,10 +1,12 @@
 #include "GameTestInputExecutor.h"
 
+#include "Async/Async.h"
+#include "Containers/Ticker.h"
 #include "Dom/JsonObject.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
-#include "GameFramework/PlayerInput.h"
+#include "HAL/PlatformProcess.h"
 #include "InputCoreTypes.h"
 #include "InputKeyEventArgs.h"
 
@@ -104,6 +106,21 @@ namespace
 		return PlayerController->InputKey(FInputKeyEventArgs::CreateSimulated(Key, Event, AmountDepressed));
 	}
 
+	FString JoinStrings(const TArray<FString>& Values, const TCHAR* Delimiter)
+	{
+		FString Joined;
+		for (int32 Index = 0; Index < Values.Num(); ++Index)
+		{
+			if (Index > 0)
+			{
+				Joined += Delimiter;
+			}
+			Joined += Values[Index];
+		}
+
+		return Joined;
+	}
+
 	bool TryMapButtonIdToKeys(const FString& ButtonId, TArray<FKey>& OutKeys)
 	{
 		const FString Normalized = NormalizeToken(ButtonId);
@@ -117,7 +134,13 @@ namespace
 			OutKeys = {EKeys::LeftMouseButton, EKeys::Gamepad_RightShoulder};
 			return true;
 		}
-		if (Normalized == TEXT("face_bottom") || Normalized == TEXT("confirm") || Normalized == TEXT("jump") || Normalized == TEXT("interact"))
+		if (Normalized == TEXT("jump"))
+		{
+			// Keep keyboard SpaceBar as primary and try face-bottom as a fallback key path.
+			OutKeys = {EKeys::SpaceBar, EKeys::Gamepad_FaceButton_Bottom};
+			return true;
+		}
+		if (Normalized == TEXT("face_bottom") || Normalized == TEXT("confirm") || Normalized == TEXT("interact"))
 		{
 			OutKeys = {EKeys::Gamepad_FaceButton_Bottom, EKeys::SpaceBar};
 			return true;
@@ -219,16 +242,78 @@ namespace
 			return false;
 		}
 
+		double DurationMs = 100.0;
+		if (NormalizedArgs.IsValid())
+		{
+			double RequestedDurationMs = 0.0;
+			if (TryReadNumberField(NormalizedArgs, TEXT("duration_ms"), RequestedDurationMs) && RequestedDurationMs > 0.0)
+			{
+				DurationMs = RequestedDurationMs;
+			}
+		}
+		const float HoldSeconds = FMath::Clamp(static_cast<float>(DurationMs / 1000.0), 0.0f, 2.0f);
+		const bool bIsJumpButton = NormalizeToken(ButtonId) == TEXT("jump");
+		TArray<FString> HandledKeyNames;
+		bool bAnyPressedHandled = false;
+		bool bAnyReleasedHandled = false;
+		bool bAnyReleaseScheduled = false;
+
 		for (const FKey& Key : CandidateKeys)
 		{
 			const bool bPressedHandled = SendSimulatedKey(PlayerController, Key, IE_Pressed, 1.0f);
-			const bool bReleasedHandled = SendSimulatedKey(PlayerController, Key, IE_Released, 0.0f);
+			bool bReleasedHandled = false;
+			bool bReleaseScheduled = false;
+
+			if (bPressedHandled)
+			{
+				TWeakObjectPtr<APlayerController> WeakController(PlayerController);
+				FTSTicker::GetCoreTicker().AddTicker(
+					FTickerDelegate::CreateLambda([WeakController, Key](float)
+					{
+						if (APlayerController* ValidController = WeakController.Get())
+						{
+							(void)SendSimulatedKey(ValidController, Key, IE_Released, 0.0f);
+						}
+						return false;
+					}),
+					FMath::Max(0.0f, HoldSeconds));
+
+				bReleasedHandled = true;
+				bReleaseScheduled = true;
+			}
+
 			if (bPressedHandled || bReleasedHandled)
 			{
-				SetDetailsString(Details, TEXT("input_key"), Key.GetFName().ToString());
-				SetDetailsString(Details, TEXT("input_mode"), TEXT("tap"));
-				return true;
+				HandledKeyNames.Add(Key.GetFName().ToString());
+				bAnyPressedHandled = bAnyPressedHandled || bPressedHandled;
+				bAnyReleasedHandled = bAnyReleasedHandled || bReleasedHandled;
+				bAnyReleaseScheduled = bAnyReleaseScheduled || bReleaseScheduled;
+
+				if (!bIsJumpButton)
+				{
+					SetDetailsString(Details, TEXT("input_key"), Key.GetFName().ToString());
+					SetDetailsString(Details, TEXT("input_mode"), TEXT("tap"));
+					SetDetailsNumber(Details, TEXT("tap_duration_ms"), DurationMs);
+					SetDetailsBool(Details, TEXT("pressed_handled"), bPressedHandled);
+					SetDetailsBool(Details, TEXT("released_handled"), bReleasedHandled);
+					SetDetailsBool(Details, TEXT("release_scheduled"), bReleaseScheduled);
+					SetDetailsNumber(Details, TEXT("release_delay_seconds"), HoldSeconds);
+					return true;
+				}
 			}
+		}
+
+		if (bIsJumpButton && HandledKeyNames.Num() > 0)
+		{
+			SetDetailsString(Details, TEXT("input_key"), JoinStrings(HandledKeyNames, TEXT(",")));
+			SetDetailsString(Details, TEXT("input_mode"), TEXT("tap_jump_fallback"));
+			SetDetailsNumber(Details, TEXT("tap_duration_ms"), DurationMs);
+			SetDetailsBool(Details, TEXT("pressed_handled"), bAnyPressedHandled);
+			SetDetailsBool(Details, TEXT("released_handled"), bAnyReleasedHandled);
+			SetDetailsBool(Details, TEXT("release_scheduled"), bAnyReleaseScheduled);
+			SetDetailsNumber(Details, TEXT("release_delay_seconds"), HoldSeconds);
+			SetDetailsBool(Details, TEXT("jump_fallback_used"), HandledKeyNames.Num() > 1);
+			return true;
 		}
 
 		OutErrorMessage = FString::Printf(TEXT("PlayerController did not handle any mapped keys for button_id '%s'."), *ButtonId);
@@ -326,48 +411,75 @@ FGameTestInputExecutionResult FGameTestInputExecutor::ExecuteCommand(const FGame
 	SetDetailsString(Result.Details, TEXT("command_name"), Request.CommandName);
 	SetDetailsString(Result.Details, TEXT("trace_id"), Request.TraceId);
 
-	FString ResolveError;
-	APlayerController* PlayerController = ResolvePlayerController(Result.Details, ResolveError);
-	if (PlayerController == nullptr)
+	auto ExecuteOnGameThread = [&Result, &Request]()
 	{
-		Result.ErrorMessage = ResolveError;
+		FString ResolveError;
+		APlayerController* PlayerController = ResolvePlayerController(Result.Details, ResolveError);
+		if (PlayerController == nullptr)
+		{
+			Result.bSucceeded = false;
+			Result.ErrorMessage = ResolveError;
+			return;
+		}
+
+		const FString CommandName = NormalizeToken(Request.CommandName);
+		bool bExecuted = false;
+		FString ExecutionError;
+
+		if (CommandName == TEXT("attack"))
+		{
+			bExecuted = ExecuteAttack(PlayerController, Result.Details, ExecutionError);
+		}
+		else if (CommandName == TEXT("tap_button"))
+		{
+			bExecuted = ExecuteTapButton(PlayerController, Request.NormalizedArgs, Result.Details, ExecutionError);
+		}
+		else if (CommandName == TEXT("move_stick"))
+		{
+			bExecuted = ExecuteMoveStick(PlayerController, Request.NormalizedArgs, false, Result.Details, ExecutionError);
+		}
+		else if (CommandName == TEXT("release_stick"))
+		{
+			bExecuted = ExecuteMoveStick(PlayerController, Request.NormalizedArgs, true, Result.Details, ExecutionError);
+		}
+		else if (CommandName == TEXT("execute_recipe"))
+		{
+			bExecuted = ExecuteRecipe(PlayerController, Request.NormalizedArgs, Result.Details, ExecutionError);
+		}
+		else
+		{
+			ExecutionError = FString::Printf(TEXT("Unsupported command for native input execution: %s"), *Request.CommandName);
+		}
+
+		Result.bSucceeded = bExecuted;
+		if (!bExecuted)
+		{
+			Result.ErrorMessage = ExecutionError;
+		}
+	};
+
+	if (IsInGameThread())
+	{
+		ExecuteOnGameThread();
 		return Result;
 	}
 
-	const FString CommandName = NormalizeToken(Request.CommandName);
-	bool bExecuted = false;
-	FString ExecutionError;
-
-	if (CommandName == TEXT("attack"))
+	FEvent* CompletionEvent = FPlatformProcess::GetSynchEventFromPool(false);
+	if (CompletionEvent == nullptr)
 	{
-		bExecuted = ExecuteAttack(PlayerController, Result.Details, ExecutionError);
-	}
-	else if (CommandName == TEXT("tap_button"))
-	{
-		bExecuted = ExecuteTapButton(PlayerController, Request.NormalizedArgs, Result.Details, ExecutionError);
-	}
-	else if (CommandName == TEXT("move_stick"))
-	{
-		bExecuted = ExecuteMoveStick(PlayerController, Request.NormalizedArgs, false, Result.Details, ExecutionError);
-	}
-	else if (CommandName == TEXT("release_stick"))
-	{
-		bExecuted = ExecuteMoveStick(PlayerController, Request.NormalizedArgs, true, Result.Details, ExecutionError);
-	}
-	else if (CommandName == TEXT("execute_recipe"))
-	{
-		bExecuted = ExecuteRecipe(PlayerController, Request.NormalizedArgs, Result.Details, ExecutionError);
-	}
-	else
-	{
-		ExecutionError = FString::Printf(TEXT("Unsupported command for native input execution: %s"), *Request.CommandName);
+		Result.bSucceeded = false;
+		Result.ErrorMessage = TEXT("Failed to allocate completion event for game thread execution.");
+		return Result;
 	}
 
-	Result.bSucceeded = bExecuted;
-	if (!bExecuted)
+	AsyncTask(ENamedThreads::GameThread, [&ExecuteOnGameThread, CompletionEvent]()
 	{
-		Result.ErrorMessage = ExecutionError;
-	}
+		ExecuteOnGameThread();
+		CompletionEvent->Trigger();
+	});
+
+	CompletionEvent->Wait();
+	FPlatformProcess::ReturnSynchEventToPool(CompletionEvent);
 
 	return Result;
 }

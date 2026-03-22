@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "source_text": "A무기를 이용해 정면에 있는 몬스터를 무찌르세요",
+  "language": "ko",
+  "intent": "defeat_monster",
+  "weapon": "A",
+  "target_selector": {
+    "type": "forward_cone",
+    "relative_to": "player_forward",
+    "yaw_degrees": 45,
+    "target_kind": "monster"
+  },
+  "success_criteria": {
+    "timeout_seconds": 90,
+    "target_state": "defeated"
+  },
+  "failure_criteria": {
+    "target_lost_timeout_seconds": 10,
+    "input_failure_limit": 3
+  },
+  "termination": {
+    "mode": "keep_running"
+  }
+}

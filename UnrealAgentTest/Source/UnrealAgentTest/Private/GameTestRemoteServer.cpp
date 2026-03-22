@@ -2,9 +2,11 @@
 
 #include "GameTestCommandService.h"
 #include "GameTestQueryService.h"
+#include "Async/Async.h"
 #include "IPAddress.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "Engine/Engine.h"
 #include "HttpPath.h"
 #include "HttpServerModule.h"
 #include "HttpServerResponse.h"
@@ -24,6 +26,10 @@
 #include "Sockets.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#if WITH_EDITOR
+#include "Editor.h"
+#include "PlayInEditorDataTypes.h"
+#endif
 
 DEFINE_LOG_CATEGORY_STATIC(LogGameTestRemoteServer, Log, All);
 
@@ -121,6 +127,155 @@ namespace
 	{
 		bool Value = DefaultValue;
 		return Json->TryGetBoolField(FieldName, Value) ? Value : DefaultValue;
+	}
+
+	bool HasActiveGameWorldWithPlayerController()
+	{
+		if (GEngine == nullptr)
+		{
+			return false;
+		}
+
+		for (const FWorldContext& WorldContext : GEngine->GetWorldContexts())
+		{
+			UWorld* World = WorldContext.World();
+			if (World == nullptr || !World->IsGameWorld())
+			{
+				continue;
+			}
+
+			if (World->GetFirstPlayerController() != nullptr)
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	bool RunOnGameThreadSync(const TFunction<void()>& InTask)
+	{
+		if (IsInGameThread())
+		{
+			InTask();
+			return true;
+		}
+
+		FEvent* CompletionEvent = FPlatformProcess::GetSynchEventFromPool(false);
+		if (CompletionEvent == nullptr)
+		{
+			return false;
+		}
+
+		AsyncTask(ENamedThreads::GameThread, [InTask, CompletionEvent]()
+		{
+			InTask();
+			CompletionEvent->Trigger();
+		});
+
+		CompletionEvent->Wait();
+		FPlatformProcess::ReturnSynchEventToPool(CompletionEvent);
+		return true;
+	}
+
+	struct FEditorAutoPlayResult
+	{
+		bool bRequested = false;
+		bool bReady = false;
+		FString ErrorCode;
+		FString ErrorMessage;
+	};
+
+	FEditorAutoPlayResult TryEnsureEditorPlayReady(bool bEnableAutoPlay, double WaitSeconds)
+	{
+		FEditorAutoPlayResult Result;
+		Result.bReady = false;
+
+		bool bAlreadyReady = false;
+		if (!RunOnGameThreadSync([&bAlreadyReady]()
+		{
+			bAlreadyReady = HasActiveGameWorldWithPlayerController();
+		}))
+		{
+			Result.ErrorCode = TEXT("auto_play_dispatch_failed");
+			Result.ErrorMessage = TEXT("Failed to dispatch readiness check to game thread.");
+			return Result;
+		}
+		if (bAlreadyReady)
+		{
+			Result.bReady = true;
+			return Result;
+		}
+
+		if (!bEnableAutoPlay)
+		{
+			Result.ErrorCode = TEXT("auto_play_disabled");
+			Result.ErrorMessage = TEXT("No active game world. Enable auto_play_editor or start PIE manually.");
+			return Result;
+		}
+
+#if WITH_EDITOR
+		if (!RunOnGameThreadSync([&Result]()
+		{
+			if (GEditor == nullptr)
+			{
+				Result.ErrorCode = TEXT("editor_unavailable");
+				Result.ErrorMessage = TEXT("GEditor is not available.");
+				return;
+			}
+
+			if (!GEditor->IsPlaySessionInProgress())
+			{
+				FRequestPlaySessionParams PlayParams;
+				PlayParams.SessionDestination = EPlaySessionDestinationType::InProcess;
+				PlayParams.WorldType = EPlaySessionWorldType::PlayInEditor;
+				GEditor->RequestPlaySession(PlayParams);
+				Result.bRequested = true;
+			}
+			else
+			{
+				Result.bRequested = true;
+			}
+		}))
+		{
+			Result.ErrorCode = TEXT("auto_play_dispatch_failed");
+			Result.ErrorMessage = TEXT("Failed to dispatch auto play request to game thread.");
+			return Result;
+		}
+#else
+		Result.ErrorCode = TEXT("auto_play_unsupported");
+		Result.ErrorMessage = TEXT("Auto play is only supported when built with editor modules.");
+		return Result;
+#endif
+
+		const double Deadline = FPlatformTime::Seconds() + FMath::Clamp(WaitSeconds, 0.0, 60.0);
+		while (FPlatformTime::Seconds() <= Deadline)
+		{
+			bool bNowReady = false;
+			if (!RunOnGameThreadSync([&bNowReady]()
+			{
+				bNowReady = HasActiveGameWorldWithPlayerController();
+			}))
+			{
+				Result.ErrorCode = TEXT("auto_play_dispatch_failed");
+				Result.ErrorMessage = TEXT("Failed to poll game world readiness on game thread.");
+				return Result;
+			}
+
+			if (bNowReady)
+			{
+				Result.bReady = true;
+				Result.ErrorCode.Reset();
+				Result.ErrorMessage.Reset();
+				return Result;
+			}
+
+			FPlatformProcess::Sleep(0.05f);
+		}
+
+		Result.ErrorCode = TEXT("auto_play_timeout");
+		Result.ErrorMessage = TEXT("Timed out waiting for PIE game world readiness.");
+		return Result;
 	}
 
 	bool SendAll(FSocket* Socket, const uint8* Data, int32 Size)
@@ -803,9 +958,37 @@ bool FGameTestRemoteServer::HandleSessionStart(const FHttpServerRequest& Request
 	FString RequestedRunId;
 	RequestJson->TryGetStringField(TEXT("session_id"), RequestedSessionId);
 	RequestJson->TryGetStringField(TEXT("run_id"), RequestedRunId);
+	const bool bAutoPlayEditor = ReadJsonBool(RequestJson.ToSharedRef(), TEXT("auto_play_editor"), true);
+	double AutoPlayWaitSeconds = 15.0;
+	if (RequestJson->HasField(TEXT("auto_play_wait_seconds")))
+	{
+		double RequestedWaitSeconds = AutoPlayWaitSeconds;
+		if (RequestJson->TryGetNumberField(TEXT("auto_play_wait_seconds"), RequestedWaitSeconds))
+		{
+			AutoPlayWaitSeconds = FMath::Clamp(RequestedWaitSeconds, 0.0, 60.0);
+		}
+	}
 
 	const FGameTestSessionRecord SessionRecord = SessionManager.StartSession(RequestedSessionId, RequestedRunId);
 	RuntimeState.EnsureSession(SessionRecord.SessionId);
+	const FEditorAutoPlayResult AutoPlayResult = TryEnsureEditorPlayReady(bAutoPlayEditor, AutoPlayWaitSeconds);
+	if (!AutoPlayResult.bReady)
+	{
+		(void)SessionManager.StopSession(SessionRecord.SessionId);
+		RuntimeState.RemoveSession(SessionRecord.SessionId);
+		EventRecorder.ClearSession(SessionRecord.SessionId);
+
+		TSharedRef<FJsonObject> ErrorJson = MakeErrorJson(
+			AutoPlayResult.ErrorCode.IsEmpty() ? TEXT("auto_play_failed") : AutoPlayResult.ErrorCode,
+			AutoPlayResult.ErrorMessage.IsEmpty() ? TEXT("Failed to ensure a playable game world.") : AutoPlayResult.ErrorMessage);
+		ErrorJson->SetStringField(TEXT("session_id"), SessionRecord.SessionId);
+		ErrorJson->SetStringField(TEXT("run_id"), SessionRecord.RunId);
+		ErrorJson->SetBoolField(TEXT("auto_play_editor"), bAutoPlayEditor);
+		ErrorJson->SetBoolField(TEXT("auto_play_editor_requested"), AutoPlayResult.bRequested);
+		ErrorJson->SetBoolField(TEXT("auto_play_editor_ready"), AutoPlayResult.bReady);
+		OnComplete(MakeJsonResponse(EHttpServerResponseCodes::ServerError, ErrorJson));
+		return true;
+	}
 
 	TSharedRef<FJsonObject> JsonBody = MakeShared<FJsonObject>();
 	JsonBody->SetBoolField(TEXT("accepted"), true);
@@ -813,6 +996,9 @@ bool FGameTestRemoteServer::HandleSessionStart(const FHttpServerRequest& Request
 	JsonBody->SetStringField(TEXT("run_id"), SessionRecord.RunId);
 	JsonBody->SetStringField(TEXT("started_at"), SessionRecord.StartedAtUtc.ToIso8601());
 	JsonBody->SetNumberField(TEXT("active_sessions"), static_cast<double>(SessionManager.GetActiveSessionCount()));
+	JsonBody->SetBoolField(TEXT("auto_play_editor"), bAutoPlayEditor);
+	JsonBody->SetBoolField(TEXT("auto_play_editor_requested"), AutoPlayResult.bRequested);
+	JsonBody->SetBoolField(TEXT("auto_play_editor_ready"), AutoPlayResult.bReady);
 
 	OnComplete(MakeJsonResponse(EHttpServerResponseCodes::Ok, JsonBody));
 	return true;

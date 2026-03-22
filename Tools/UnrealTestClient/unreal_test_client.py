@@ -270,12 +270,19 @@ class UnrealTestClient:
         self._capabilities_cache = capabilities
         return capabilities
 
-    def start_session(self, session_id: Optional[str] = None, run_id: Optional[str] = None) -> JsonObject:
+    def start_session(
+        self,
+        session_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        options: Optional[Mapping[str, Any]] = None,
+    ) -> JsonObject:
         payload: JsonObject = {}
         if session_id:
             payload["session_id"] = session_id
         if run_id:
             payload["run_id"] = run_id
+        if options:
+            payload.update(dict(options))
 
         response = self._request("POST", "/session/start", json_body=payload)
         session_value = response.get("session_id")

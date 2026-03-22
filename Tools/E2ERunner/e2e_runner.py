@@ -22,6 +22,10 @@ from Tools.ParallelRunner.parallel_runner import (  # noqa: E402
     generate_session_id,
     utc_now_iso,
 )
+from Tools.E2ERunner.scenario_schema import (  # noqa: E402
+    TERMINATION_MODES,
+    validate_scenario,
+)
 from Tools.UnrealTestClient.unreal_test_client import (  # noqa: E402
     UnrealTestClient,
     UnrealTestClientError,
@@ -276,6 +280,80 @@ def _should_tolerate_approach_failure(failure: Mapping[str, Any]) -> bool:
     return False
 
 
+def _safe_int(value: Any, fallback: int) -> int:
+    if isinstance(value, bool):
+        return fallback
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return fallback
+    return fallback
+
+
+def _load_scenario_definition(args: argparse.Namespace, *, run_dir: Path) -> tuple[Dict[str, Any], str]:
+    if bool(args.scenario_json) == bool(args.scenario_file):
+        raise E2ERunnerError("Provide exactly one of --scenario-json or --scenario-file.")
+
+    source = "scenario-json"
+    if args.scenario_json:
+        try:
+            payload = json.loads(args.scenario_json)
+        except json.JSONDecodeError as exc:
+            raise E2ERunnerError(f"Invalid --scenario-json payload: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise E2ERunnerError("--scenario-json must decode to a JSON object.")
+        scenario = dict(payload)
+    else:
+        source = "scenario-file"
+        scenario_path = args.scenario_file.expanduser().resolve()
+        try:
+            raw = scenario_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise E2ERunnerError(f"Failed to read scenario file: {scenario_path}") from exc
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise E2ERunnerError(f"Invalid scenario file JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise E2ERunnerError("Scenario file must contain a JSON object.")
+        scenario = dict(payload)
+
+    termination = scenario.get("termination")
+    if isinstance(termination, Mapping):
+        scenario["termination"] = dict(termination)
+    else:
+        scenario["termination"] = {}
+    if args.termination_mode:
+        scenario["termination"]["mode"] = args.termination_mode
+
+    errors = validate_scenario(scenario)
+    if errors:
+        raise E2ERunnerError(f"Scenario validation failed: {'; '.join(errors)}")
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    validated_path = run_dir / "scenario.validated.json"
+    _write_json(validated_path, scenario)
+    return scenario, source
+
+
+def _send_command(
+    client: UnrealTestClient,
+    *,
+    session_id: str,
+    command: str,
+    request_args: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    response = client.send_command(command, session_id=session_id, args=request_args)
+    if isinstance(response, Mapping):
+        return response
+    raise E2ERunnerError(f"{command} command response is not a JSON object.")
+
+
 def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
     started_at_monotonic = time.monotonic()
     run_id = args.run_id or generate_run_id(prefix="e2e")
@@ -290,7 +368,7 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
         "run_id": run_id,
         "session_id": session_id,
         "mode": mode,
-        "scenario": args.scenario or "default",
+        "scenario": "default",
         "base_url": args.base_url,
         "started_at_utc": utc_now_iso(),
         "ended_at_utc": None,
@@ -325,6 +403,7 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
 
     launch_ctx: Optional[_LaunchContext] = None
     started_session = False
+    termination_mode = args.termination_mode or "keep_running"
     client = UnrealTestClient(
         args.base_url,
         timeout=args.request_timeout,
@@ -333,6 +412,38 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     try:
+        scenario_definition, scenario_source = _load_scenario_definition(args, run_dir=run_dir)
+        result["scenario"] = str(scenario_definition.get("intent", args.scenario or "default"))
+        result["notes"].append(f"scenario_source:{scenario_source}")
+        result["notes"].append(f"scenario_validated_path:{run_dir / 'scenario.validated.json'}")
+
+        scenario_termination = scenario_definition.get("termination", {})
+        if isinstance(scenario_termination, Mapping):
+            candidate_mode = str(scenario_termination.get("mode", args.termination_mode)).strip()
+            if candidate_mode in TERMINATION_MODES:
+                termination_mode = candidate_mode
+        result["notes"].append(f"termination_mode:{termination_mode}")
+
+        success_criteria = scenario_definition.get("success_criteria", {})
+        failure_criteria = scenario_definition.get("failure_criteria", {})
+        target_selector = scenario_definition.get("target_selector", {})
+        overall_timeout_seconds = _safe_float(
+            success_criteria.get("timeout_seconds") if isinstance(success_criteria, Mapping) else None,
+            args.overall_timeout_seconds,
+        )
+        target_lost_timeout_seconds = _safe_float(
+            failure_criteria.get("target_lost_timeout_seconds") if isinstance(failure_criteria, Mapping) else None,
+            args.target_lost_timeout_seconds,
+        )
+        max_consecutive_input_failures = _safe_int(
+            failure_criteria.get("input_failure_limit") if isinstance(failure_criteria, Mapping) else None,
+            args.max_consecutive_input_failures,
+        )
+        front_cone_half_angle_degrees = _safe_float(
+            target_selector.get("yaw_degrees") if isinstance(target_selector, Mapping) else None,
+            args.front_cone_half_angle_degrees,
+        )
+
         launch_ctx = _start_unreal_if_requested(args, run_id=run_id, session_id=session_id, run_dir=run_dir)
         if launch_ctx is not None:
             result["launch"]["pid"] = launch_ctx.process.pid
@@ -363,8 +474,12 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
         cursor = _safe_sequence(client.get_events(session_id=session_id, limit=1).get("last_sequence"), 0)
 
         equip_args = {"recipe_id": args.equip_recipe_id}
-        if args.equip_recipe_arg:
-            equip_args["args"] = _parse_key_value_args(args.equip_recipe_arg)
+        weapon_value = scenario_definition.get("weapon")
+        equip_recipe_args: Dict[str, str] = _parse_key_value_args(args.equip_recipe_arg) if args.equip_recipe_arg else {}
+        if isinstance(weapon_value, str) and weapon_value.strip() and "weapon" not in equip_recipe_args:
+            equip_recipe_args["weapon"] = weapon_value.strip()
+        if equip_recipe_args:
+            equip_args["args"] = equip_recipe_args
         equip_step = _send_command_step(
             client,
             result,
@@ -377,166 +492,265 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
         equip_step["observation"] = {
             "equipped_weapon_id": player_after_equip.get("equipped_weapon_id"),
             "current_action": player_after_equip.get("current_action"),
+            "scenario_weapon": weapon_value,
         }
         result["checks"]["equip"] = True
 
-        spatial_before_approach = client.get_spatial_state(session_id=session_id)
-        stick_x = _safe_float(spatial_before_approach.get("recommended_left_stick_x"), args.approach_x)
-        stick_y = _safe_float(spatial_before_approach.get("recommended_left_stick_y"), args.approach_y)
-        approach_args = {
-            "stick_id": args.approach_stick_id,
-            "x": stick_x,
-            "y": stick_y,
-            "duration_ms": args.approach_duration_ms,
-        }
-        try:
-            approach_step = _send_command_step(
-                client,
-                result,
-                name="approach",
-                command="move_stick",
-                session_id=session_id,
-                request_args=approach_args,
-            )
-            spatial_after_approach = client.get_spatial_state(session_id=session_id)
-            approach_step["observation"] = {
-                "distance_cm": spatial_after_approach.get("distance_cm"),
-                "recommended_left_stick_x": spatial_after_approach.get("recommended_left_stick_x"),
-                "recommended_left_stick_y": spatial_after_approach.get("recommended_left_stick_y"),
-                "target_in_attack_range": spatial_after_approach.get("target_in_attack_range"),
-            }
-            _send_command_step(
-                client,
-                result,
-                name="approach_release",
-                command="release_stick",
-                session_id=session_id,
-                request_args={"stick_id": args.approach_stick_id},
-            )
-            result["checks"]["approach"] = True
-        except E2ERunnerError:
-            latest_step = result["steps"][-1] if result["steps"] else None
-            latest_failure = latest_step.get("failure") if isinstance(latest_step, Mapping) else None
-            should_tolerate = (
-                bool(latest_failure)
-                and isinstance(latest_failure, Mapping)
-                and not args.strict_approach
-                and _should_tolerate_approach_failure(latest_failure)
-            )
-            if not should_tolerate:
-                raise
-
-            assert isinstance(latest_step, dict)
-            assert isinstance(latest_failure, Mapping)
-            latest_step["status"] = "skipped"
-            latest_step["observation"] = {
-                "approach_skipped": True,
-                "reason": "native_axis_input_not_handled",
-            }
-            result["notes"].append("approach_step_skipped:native_axis_input_not_handled")
-
-        attack_step = _create_step_record("attack", command="attack", request_args={})
-        result["steps"].append(attack_step)
-        attack_started_at_monotonic = time.monotonic()
-        attempts: list[Dict[str, Any]] = []
+        engage_step = _create_step_record(
+            "engage",
+            command="state_driven_engage",
+            request_args={
+                "front_cone_half_angle_degrees": front_cone_half_angle_degrees,
+                "overall_timeout_seconds": overall_timeout_seconds,
+                "target_lost_timeout_seconds": target_lost_timeout_seconds,
+                "max_consecutive_input_failures": max_consecutive_input_failures,
+                "attack_max_attempts": args.attack_max_attempts,
+            },
+        )
+        result["steps"].append(engage_step)
+        engage_started_at_monotonic = time.monotonic()
+        engage_deadline = engage_started_at_monotonic + max(1.0, overall_timeout_seconds)
+        movement_attempts: list[Dict[str, Any]] = []
+        attack_attempts: list[Dict[str, Any]] = []
+        consecutive_input_failures = 0
+        target_lost_since: Optional[float] = None
         actor_died_event: Optional[Mapping[str, Any]] = None
         final_target_state: Optional[Mapping[str, Any]] = None
+        action_cycles = 0
+        engage_observation: Dict[str, Any] = {
+            "movement_attempts": movement_attempts,
+            "attack_attempts": attack_attempts,
+            "target_selector": {
+                "half_angle_degrees": front_cone_half_angle_degrees,
+            },
+        }
 
-        for attempt in range(1, args.attack_max_attempts + 1):
-            attempt_started_at = time.monotonic()
-            response = client.send_command("attack", session_id=session_id, args={})
-            attempt_record: Dict[str, Any] = {
-                "attempt": attempt,
-                "response": dict(response),
-                "duration_seconds": None,
-                "target_alive": None,
-                "target_health": None,
-                "actor_died_event": None,
-            }
+        def _fail_engage(
+            code: str,
+            message: str,
+            *,
+            details: Optional[Mapping[str, Any]] = None,
+            response: Optional[Mapping[str, Any]] = None,
+        ) -> None:
+            failure = _make_failure("engage", code, message, details=details)
+            _finalize_step_record(
+                engage_step,
+                status="failed",
+                response=response,
+                observation=engage_observation,
+                failure=failure,
+                started_at_monotonic=engage_started_at_monotonic,
+            )
+            raise E2ERunnerError(message)
 
-            if not bool(response.get("accepted", False)):
-                attempt_record["failure"] = _make_failure(
-                    "attack",
-                    str(response.get("error_code", "command_rejected")),
-                    str(response.get("error_message", "attack command was rejected.")),
-                    details={"error_stage": response.get("error_stage")},
+        while True:
+            now = time.monotonic()
+            if now >= engage_deadline:
+                _fail_engage(
+                    "overall_timeout",
+                    f"Failed to defeat target within {overall_timeout_seconds} seconds.",
+                    details={
+                        "overall_timeout_seconds": overall_timeout_seconds,
+                        "attack_attempts": len(attack_attempts),
+                        "movement_attempts": len(movement_attempts),
+                    },
                 )
-                attempt_record["duration_seconds"] = round(max(0.0, time.monotonic() - attempt_started_at), 3)
-                attempts.append(attempt_record)
-                failure = attempt_record["failure"]
-                _finalize_step_record(
-                    attack_step,
-                    status="failed",
-                    response=response,
-                    observation={"attempts": attempts},
-                    failure=failure,
-                    started_at_monotonic=attack_started_at_monotonic,
-                )
-                raise E2ERunnerError(f"attack command rejected on attempt {attempt}: {failure['message']}")
 
-            if args.post_attack_settle_seconds > 0.0:
-                time.sleep(args.post_attack_settle_seconds)
+            action_cycles += 1
+            spatial_state = client.get_spatial_state(session_id=session_id)
+            target_state = client.get_target_state(session_id=session_id)
+            final_target_state = target_state
 
-            final_target_state = client.get_target_state(session_id=session_id)
             actor_died_event, cursor = _read_actor_died_event(client, session_id, cursor)
-
-            target_alive = bool(final_target_state.get("alive", True))
-            attempt_record["target_alive"] = target_alive
-            attempt_record["target_health"] = final_target_state.get("health")
-            attempt_record["actor_died_event"] = dict(actor_died_event) if actor_died_event is not None else None
-            attempt_record["duration_seconds"] = round(max(0.0, time.monotonic() - attempt_started_at), 3)
-            attempts.append(attempt_record)
-
-            if not target_alive:
-                result["success"]["target_alive"] = False
-                result["success"]["success_condition"] = "target_state.alive=false"
-                break
-
             if actor_died_event is not None:
                 result["success"]["actor_died_event_detected"] = True
                 result["success"]["success_condition"] = "actor_died_event"
                 break
 
-            if attempt < args.attack_max_attempts and args.attack_interval_seconds > 0.0:
-                time.sleep(args.attack_interval_seconds)
+            target_alive = bool(target_state.get("alive", True))
+            if not target_alive:
+                result["success"]["target_alive"] = False
+                result["success"]["success_condition"] = "target_state.alive=false"
+                break
+
+            target_actor_id = str(spatial_state.get("target_actor_id") or target_state.get("actor_id") or "").strip()
+            if not target_actor_id:
+                if target_lost_since is None:
+                    target_lost_since = now
+                elif (now - target_lost_since) >= max(1.0, target_lost_timeout_seconds):
+                    _fail_engage(
+                        "target_lost_timeout",
+                        "Target could not be tracked long enough to continue combat.",
+                        details={
+                            "target_lost_timeout_seconds": target_lost_timeout_seconds,
+                        },
+                    )
+            else:
+                target_lost_since = None
+
+            yaw_delta = abs(_safe_float(spatial_state.get("yaw_delta_degrees"), 9999.0))
+            in_front = yaw_delta <= max(1.0, front_cone_half_angle_degrees)
+            in_attack_range = bool(spatial_state.get("target_in_attack_range", False))
+
+            if in_front and in_attack_range:
+                attack_started_at = time.monotonic()
+                attack_response = _send_command(client, session_id=session_id, command="attack", request_args={})
+                attack_record: Dict[str, Any] = {
+                    "index": len(attack_attempts) + 1,
+                    "accepted": bool(attack_response.get("accepted", False)),
+                    "duration_seconds": None,
+                    "error_code": attack_response.get("error_code"),
+                    "error_message": attack_response.get("error_message"),
+                }
+
+                if not attack_record["accepted"]:
+                    error_code = str(attack_response.get("error_code", "command_rejected"))
+                    attack_record["duration_seconds"] = round(max(0.0, time.monotonic() - attack_started_at), 3)
+                    attack_attempts.append(attack_record)
+                    if error_code == "input_execution_failed":
+                        consecutive_input_failures += 1
+                        if consecutive_input_failures >= max(1, max_consecutive_input_failures):
+                            _fail_engage(
+                                "input_execution_failed_limit",
+                                "Attack failed repeatedly due to input execution errors.",
+                                details={
+                                    "max_consecutive_input_failures": max_consecutive_input_failures,
+                                    "last_error_message": attack_response.get("error_message"),
+                                },
+                                response=attack_response,
+                            )
+                        time.sleep(max(0.05, args.poll_interval))
+                        continue
+
+                    _fail_engage(
+                        error_code,
+                        str(attack_response.get("error_message", "Attack command was rejected.")),
+                        details={"error_stage": attack_response.get("error_stage")},
+                        response=attack_response,
+                    )
+
+                consecutive_input_failures = 0
+                result["checks"]["attack"] = True
+                if not result["checks"]["approach"]:
+                    result["checks"]["approach"] = True
+
+                if args.post_attack_settle_seconds > 0.0:
+                    time.sleep(args.post_attack_settle_seconds)
+
+                final_target_state = client.get_target_state(session_id=session_id)
+                actor_died_event, cursor = _read_actor_died_event(client, session_id, cursor)
+
+                attack_record["duration_seconds"] = round(max(0.0, time.monotonic() - attack_started_at), 3)
+                attack_record["target_alive"] = bool(final_target_state.get("alive", True))
+                attack_record["target_health"] = final_target_state.get("health")
+                attack_record["actor_died_event"] = dict(actor_died_event) if actor_died_event is not None else None
+                attack_attempts.append(attack_record)
+
+                if actor_died_event is not None:
+                    result["success"]["actor_died_event_detected"] = True
+                    result["success"]["success_condition"] = "actor_died_event"
+                    break
+                if not bool(final_target_state.get("alive", True)):
+                    result["success"]["target_alive"] = False
+                    result["success"]["success_condition"] = "target_state.alive=false"
+                    break
+
+                if len(attack_attempts) >= max(1, args.attack_max_attempts):
+                    _fail_engage(
+                        "target_survived",
+                        f"Target was still alive after {args.attack_max_attempts} attack attempts.",
+                        details={
+                            "attack_attempts": len(attack_attempts),
+                            "target_health": final_target_state.get("health"),
+                        },
+                    )
+
+                if args.attack_interval_seconds > 0.0:
+                    time.sleep(args.attack_interval_seconds)
+                continue
+
+            stick_x = _safe_float(spatial_state.get("recommended_left_stick_x"), args.approach_x)
+            stick_y = _safe_float(spatial_state.get("recommended_left_stick_y"), args.approach_y)
+            move_request_args = {
+                "stick_id": args.approach_stick_id,
+                "x": stick_x,
+                "y": stick_y,
+                "duration_ms": args.approach_duration_ms,
+            }
+            move_started_at = time.monotonic()
+            move_response = _send_command(client, session_id=session_id, command="move_stick", request_args=move_request_args)
+            movement_record: Dict[str, Any] = {
+                "index": len(movement_attempts) + 1,
+                "request_args": move_request_args,
+                "accepted": bool(move_response.get("accepted", False)),
+                "duration_seconds": None,
+                "error_code": move_response.get("error_code"),
+                "error_message": move_response.get("error_message"),
+                "yaw_delta_degrees": spatial_state.get("yaw_delta_degrees"),
+                "target_in_attack_range": spatial_state.get("target_in_attack_range"),
+            }
+
+            if not movement_record["accepted"]:
+                error_code = str(move_response.get("error_code", "command_rejected"))
+                movement_record["duration_seconds"] = round(max(0.0, time.monotonic() - move_started_at), 3)
+                movement_attempts.append(movement_record)
+                failure_info = _make_failure(
+                    "approach",
+                    error_code,
+                    str(move_response.get("error_message", "move_stick command was rejected.")),
+                )
+                tolerate = (not args.strict_approach) and _should_tolerate_approach_failure(failure_info)
+                if tolerate:
+                    consecutive_input_failures += 1
+                    if consecutive_input_failures >= max(1, max_consecutive_input_failures):
+                        _fail_engage(
+                            "input_execution_failed_limit",
+                            "Approach failed repeatedly due to axis input execution errors.",
+                            details={
+                                "max_consecutive_input_failures": max_consecutive_input_failures,
+                                "last_error_message": move_response.get("error_message"),
+                            },
+                            response=move_response,
+                        )
+                    time.sleep(max(0.05, args.poll_interval))
+                    continue
+
+                _fail_engage(
+                    error_code,
+                    str(move_response.get("error_message", "move_stick command was rejected.")),
+                    details={"error_stage": move_response.get("error_stage")},
+                    response=move_response,
+                )
+
+            release_response = _send_command(
+                client,
+                session_id=session_id,
+                command="release_stick",
+                request_args={"stick_id": args.approach_stick_id},
+            )
+            movement_record["release_accepted"] = bool(release_response.get("accepted", False))
+            movement_record["duration_seconds"] = round(max(0.0, time.monotonic() - move_started_at), 3)
+            movement_attempts.append(movement_record)
+            consecutive_input_failures = 0
+            result["checks"]["approach"] = True
+            time.sleep(max(0.05, args.poll_interval))
 
         if final_target_state is None:
             final_target_state = client.get_target_state(session_id=session_id)
-
         result["success"]["target_alive"] = bool(final_target_state.get("alive", True))
         result["success"]["actor_died_event_detected"] = actor_died_event is not None
         result["final_state"]["target_state"] = dict(final_target_state)
 
-        if result["success"]["success_condition"] is None:
-            failure = _make_failure(
-                "attack",
-                "target_survived",
-                f"Target was still alive after {args.attack_max_attempts} attack attempts.",
-                details={
-                    "attempts": args.attack_max_attempts,
-                    "target_alive": final_target_state.get("alive"),
-                    "target_health": final_target_state.get("health"),
-                },
-            )
-            _finalize_step_record(
-                attack_step,
-                status="failed",
-                observation={"attempts": attempts},
-                failure=failure,
-                started_at_monotonic=attack_started_at_monotonic,
-            )
-            raise E2ERunnerError(failure["message"])
-
-        attack_observation: Dict[str, Any] = {"attempts": attempts}
+        engage_observation["action_cycles"] = action_cycles
+        engage_observation["consecutive_input_failures"] = consecutive_input_failures
         if actor_died_event is not None:
-            attack_observation["actor_died_event"] = dict(actor_died_event)
+            engage_observation["actor_died_event"] = dict(actor_died_event)
         _finalize_step_record(
-            attack_step,
+            engage_step,
             status="passed",
-            observation=attack_observation,
-            started_at_monotonic=attack_started_at_monotonic,
+            observation=engage_observation,
+            started_at_monotonic=engage_started_at_monotonic,
         )
-        result["checks"]["attack"] = True
 
         stop_response = client.stop_session(session_id=session_id)
         result["session_stop"] = stop_response
@@ -568,6 +782,8 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
 
         if launch_ctx is not None:
             if args.keep_process:
+                result["notes"].append("launched_process_kept_alive:override")
+            elif termination_mode == "keep_running":
                 result["notes"].append("launched_process_kept_alive")
             else:
                 try:
@@ -581,6 +797,8 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
                 launch_ctx.log_stream.close()
             except Exception:  # noqa: BLE001
                 pass
+        elif termination_mode != "keep_running":
+            result["notes"].append(f"termination_mode_not_applied_in_attach:{termination_mode}")
 
         result["ended_at_utc"] = utc_now_iso()
         result["duration_seconds"] = round(max(0.0, time.monotonic() - started_at_monotonic), 3)
@@ -597,6 +815,47 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--retry-backoff", type=float, default=0.25, help="HTTP retry backoff seconds.")
     parser.add_argument("--health-timeout", type=float, default=90.0, help="Health wait timeout seconds.")
     parser.add_argument("--poll-interval", type=float, default=0.25, help="Polling interval seconds.")
+    parser.add_argument(
+        "--scenario-json",
+        default="",
+        help="실행할 시나리오 JSON 문자열.",
+    )
+    parser.add_argument(
+        "--scenario-file",
+        type=Path,
+        default=None,
+        help="실행할 시나리오 JSON 파일 경로.",
+    )
+    parser.add_argument(
+        "--termination-mode",
+        default=None,
+        choices=sorted(TERMINATION_MODES),
+        help="테스트 종료 시 프로세스 종료 정책(생략 시 시나리오 값 사용, 기본 keep_running).",
+    )
+    parser.add_argument(
+        "--front-cone-half-angle-degrees",
+        type=float,
+        default=45.0,
+        help="정면 판정 반각(도).",
+    )
+    parser.add_argument(
+        "--overall-timeout-seconds",
+        type=float,
+        default=90.0,
+        help="시나리오 전체 타임아웃(초).",
+    )
+    parser.add_argument(
+        "--target-lost-timeout-seconds",
+        type=float,
+        default=10.0,
+        help="타겟 상실 허용 시간(초).",
+    )
+    parser.add_argument(
+        "--max-consecutive-input-failures",
+        type=int,
+        default=3,
+        help="연속 input_execution_failed 허용 횟수.",
+    )
 
     parser.add_argument("--equip-recipe-id", default="equip", help="Recipe id used for the equip step.")
     parser.add_argument(

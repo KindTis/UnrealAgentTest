@@ -1,9 +1,7 @@
 # unreal-agent-test-remote-api CheckList
 
 ## Todo
-- [ ] `IA-04`/`IA-05`: attach 모드 기본 실행 경로에서 자연어 입력을 시나리오 JSON으로 변환하는 인터페이스 구현.
-- [ ] `IA-02`/`IA-03`: 현재 상태/몬스터 위치 기반 이동→공격→처치 실행 루프를 시나리오 실행기에 통합.
-- [ ] `IA-05`: 시나리오 종료 옵션(`keep_running`, `close_game`, `close_editor`) 스키마/실행 반영.
+- [ ] 없음.
 
 ## In Progress
 - [ ] 없음.
@@ -44,11 +42,17 @@
 - [x] `OA-00`: `python Tools/E2ERunner/e2e_runner.py --launch --base-url http://127.0.0.1:31001 --health-timeout 90 --poll-interval 0.2` 실호출 E2E 통과(`ok=true`, run_id=`e2e-20260322T035026Z-3526`).
 - [x] `IA-02`: `move_stick/release_stick` 축 입력 처리 결과와 명령 수락 판정 불일치 수정(`GameTestInputExecutor`).
 - [x] `IA-01`: 엔진 종료 단계 `HTTPServer` 모듈 언로드 이후 `StopAllListeners` 호출로 인한 assert 방지 패치(`GameTestRemoteServer::Stop`).
-- [x] `OA-00`: 1차 마일스톤 완료 기준 확정(attach 기본, 자연어→시나리오 JSON, 상태 기반 이동/공격/처치, 종료 옵션 포함).
+- [x] `OA-00`: 1차 마일스톤 완료 기준 확정(attach 기본, AI Agent 사전 작성 시나리오 JSON, 상태 기반 이동/공격/처치, 종료 옵션 포함).
 - [x] `OA-00`: SDK 정책 확정(Python 공식, 저장소 내 포함형 비설치 기본, SDK/Main/Sub 계층 분리).
 - [x] `OA-00`: 병렬 실행 정책 확정(`max_concurrent_sessions=2`, FIFO 대기열, `queue_wait_timeout=120s`, `session_timeout=180s`, 연결/헬스체크 실패 1회 재시도).
 - [x] `OA-00`: 리소스 가드 임계값 0으로 고정(`cpu_percent_limit=0`, `memory_available_mb_limit=0`, 가드 무시).
 - [x] `OA-00`: 초기 시나리오 최소 범위 확정(`"A무기로 정면 몬스터를 무찌르세요"`, 전방 ±45도 최단거리 타겟 규칙, 성공/실패/종료 옵션 기준).
+- [x] `IA-04`: 시나리오 검증 모듈 추가(`Tools/E2ERunner/scenario_schema.py`), JSON 포맷 검증(`validate_scenario`) 적용.
+- [x] `IA-04`/`IA-05`: `e2e_runner`를 시나리오 JSON 입력 전용(`--scenario-json`, `--scenario-file`)으로 정리하고 attach 기본 실행 경로 통합.
+- [x] `IA-02`/`IA-03`: `e2e_runner`에 상태 기반 전투 루프 통합(전방 ±45도 판정, 이동/공격 반복, `actor_died`/`target_state.alive=false` 성공 판정).
+- [x] `IA-05`: `e2e_runner` 종료 옵션(`keep_running`, `close_game`, `close_editor`) 반영 및 attach 모드 미적용 노트 처리.
+- [x] `IA-05`: `parallel_runner` 병렬 정책 구현(`max_concurrent_sessions=2`, FIFO queue, `queue_wait_timeout=120s`, `session_timeout=180s`, 리소스 가드 기본값 0 비활성).
+- [x] `IA-04`: `e2e_runner`에서 자연어/LLM 컴파일 의존 제거 및 AI Agent 작성 JSON 실행 흐름으로 단순화.
 
 ## Validation Status
 - Passed: `ThirdPersonActionEditor Win64 Development` 빌드 성공 (2026-03-22, Loop 6 통합 반영 후).
@@ -64,6 +68,14 @@
 - Passed: `python Tools/E2ERunner/e2e_runner.py --launch --base-url http://127.0.0.1:31001 --health-timeout 90 --poll-interval 0.2` (`ok=true`, run_id=`e2e-20260322T035026Z-3526`).
 - Passed: `Artifacts/E2ERunner/runs/e2e-20260322T035026Z-3526/report.json` JSON 스키마 검증 통과(`schema_validation:OK`).
 - Passed: `ThirdPersonActionEditor Win64 Development` 빌드 성공 (2026-03-22, 종료 안정성 패치 반영 후).
+- Passed: `python -m py_compile Tools/E2ERunner/e2e_runner.py`.
+- Passed: `python -m py_compile Tools/E2ERunner/scenario_schema.py`.
+- Passed: `python -m py_compile Tools/ParallelRunner/parallel_runner.py`.
+- Passed: `python Tools/E2ERunner/e2e_runner.py --help` (신규 CLI 옵션 노출 확인).
+- Passed: `python Tools/ParallelRunner/parallel_runner.py --help` (정책 CLI 옵션 노출 확인).
+- Passed: `python Tools/E2ERunner/e2e_runner.py --help` (시나리오 JSON 입력 전용 CLI 확인).
+- Passed: `python Tools/ParallelRunner/parallel_runner.py --count 1 --base-port 30000 --artifacts-root .\\Artifacts\\ParallelRunner_Sample` (`policy` 블록 출력 확인).
+- Passed: `python Tools/E2ERunner/e2e_runner.py --base-url http://127.0.0.1:39999 --scenario-file .\\Artifacts\\E2ERunner\\sample_scenario.json --health-timeout 0.2 --poll-interval 0.05` (attach 경로 JSON 입력/검증 후 헬스체크 타임아웃 정상 실패 확인, run_id=`e2e-20260322T052640Z-44b1`).
 
 ## Deferred / Out of Scope
 - [ ] Shipping 빌드 상시 활성화 원격 제어 기능.

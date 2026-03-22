@@ -5,6 +5,10 @@
 기본 경로는 AI Agent(Sub)가 `observe.json`을 직접 판독하고 `decide.json`을 작성하는 방식입니다.  
 이 문서는 API 호출 기반 자동 decider가 필요할 때만 사용합니다.
 
+수동 decider 운영 절차(실전 재현/lock 이슈 대응)는 아래 문서를 우선 참고합니다.
+
+- `Tools/E2ERunner/VISION_DECIDER_RUNBOOK.md`
+
 ## 1) 필수 환경 변수
 
 ```powershell

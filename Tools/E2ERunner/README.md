@@ -53,6 +53,11 @@ python Tools/E2ERunner/e2e_runner.py --base-url http://127.0.0.1:31001 --scenari
 3. 러너가 액션을 검증한 뒤 `send_command`로 실행합니다.
 4. 성공 조건이 만족될 때까지 반복합니다.
 
+실전 운영 절차(다른 에이전트 재현용):
+
+- `Tools/E2ERunner/VISION_DECIDER_RUNBOOK.md`
+- Runner 실행, `observe.json` 실시간 판독, `decide.json` 원자적 쓰기, `bridge.lock` 재시도 처리, 금지사항(red-pixel 로직 추가 금지)을 포함합니다.
+
 ### 성공 판정
 
 - `position`: `goal.position_target`이 있으면 좌표 판정이 우선입니다.

@@ -67,6 +67,12 @@
 3. 러너가 JSON을 검증하고 액션을 실행합니다.
 4. 성공 조건이 충족되거나 실패 조건에 걸릴 때까지 반복합니다.
 
+실전 재현은 `VISION_DECIDER_RUNBOOK.md`를 우선 기준으로 사용합니다.
+
+- 경로: `Tools/E2ERunner/VISION_DECIDER_RUNBOOK.md`
+- 목적: 다른 AI 모델이 Runner 실행 후 `observe -> decide` 루프를 누락하지 않도록 운영 절차를 고정합니다.
+- 특히 파일 교체 타이밍(`bridge.lock`, `observe.json`, `decide.json`) 대응과 원자적 저장 규칙을 포함합니다.
+
 ## 3. 즉시 실패 조건
 
 아래 상태는 "판독 불가"로 간주합니다.
@@ -101,3 +107,9 @@
 - `success.success_condition`
 - 실패 시 `failure` 사유
 - `report.json` 저장 경로
+
+## 6. 엄격 금지 규칙
+
+- red pixel/OpenCV 임계치 검출 같은 임의 로직을 추가하지 않습니다.
+- 이미지 판독 없이 `camera_yaw`만 반복하지 않습니다.
+- Runner만 실행하고 decider 루프를 시작하지 않는 상태를 허용하지 않습니다.

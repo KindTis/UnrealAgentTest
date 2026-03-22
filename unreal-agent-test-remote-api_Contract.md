@@ -214,3 +214,16 @@
   - SDK 구현(Python)
   - `unreal-agent-test-remote-api_CheckList.md`
   - `unreal-agent-test-remote-api_Context.md`
+
+## 운영 결정사항 (2026-03-22)
+- 1차 마일스톤 기본 실행 모드는 게임/에디터 실행 상태에서 attach다(`--launch`는 보조 모드).
+- 자연어 테스트 지시를 시나리오 JSON으로 변환해 실행하는 흐름을 기준 경로로 채택한다.
+- 시나리오는 종료 정책 옵션을 포함해야 한다(`keep_running`, `close_game`, `close_editor`).
+- SDK는 Python을 공식 구현으로 사용하고, 1차 마일스톤에서는 저장소 내 포함형(비설치 기본)으로 운영한다.
+- SDK는 공통 통신/세션 계층만 담당하며 Main 오케스트레이션 및 Sub 시나리오 전술 로직은 Runner 계층에서 분리한다.
+- 병렬 실행 기본값은 `max_concurrent_sessions=2`다.
+- 병렬 실행 초과 요청은 FIFO 대기열로 처리하고 `queue_wait_timeout_seconds=120` 초과 시 `queue_timeout`으로 실패 처리한다.
+- 세션 타임아웃 기본값은 `session_timeout_seconds=180`이며 연결/헬스체크 실패에 한해 1회 재시도한다.
+- 리소스 가드는 설정 필드를 유지하되 1차 마일스톤 기본값은 `cpu_percent_limit=0`, `memory_available_mb_limit=0`으로 비활성 처리한다.
+- 초기 필수 시나리오는 `"A무기로 정면 몬스터를 무찌르세요"` 단일 기준선으로 고정한다.
+- 초기 타겟 선택 규칙은 전방 ±45도 내 생존 몬스터 중 최단거리 우선이다.

@@ -18,6 +18,7 @@
 - `loop`
 - `capture`
 - `decision_bridge`
+- `decision_policy` (선택, 권장)
 - `termination`
 
 ### `goal`
@@ -57,6 +58,14 @@
 - `mode = file`
 - `decide_wait_timeout_seconds`
 - `decide_retry_count`
+
+### `decision_policy` (권장)
+
+- 모델 간 편차를 줄이기 위한 정규화 규칙입니다.
+- `mode = strict | advisory`
+- `target_missing.strategy = llm | scan_yaw`
+- `target_found.strategy = llm | success_after_wait`
+- `guardrails.require_image_observation`, `guardrails.max_actions_per_iteration`
 
 ## 2. 실행 흐름
 

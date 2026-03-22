@@ -58,6 +58,11 @@ python Tools/E2ERunner/e2e_runner.py --base-url http://127.0.0.1:31001 --scenari
 - `Tools/E2ERunner/VISION_DECIDER_RUNBOOK.md`
 - Runner 실행, `observe.json` 실시간 판독, `decide.json` 원자적 쓰기, `bridge.lock` 재시도 처리, 금지사항(red-pixel 로직 추가 금지)을 포함합니다.
 
+정규화된 decider 정책:
+
+- `vision_navigation` 시나리오에 `decision_policy`를 넣으면 모델 종류와 무관하게 동일한 규칙을 강제할 수 있습니다.
+- 예: `target_missing.strategy=scan_yaw`, `scan_step_degrees=45`, `target_found.strategy=success_after_wait`, `success_wait_seconds=1.0`
+
 ### 성공 판정
 
 - `position`: `goal.position_target`이 있으면 좌표 판정이 우선입니다.

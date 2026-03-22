@@ -46,6 +46,9 @@ VISION_NAVIGATION_DEFAULT_CAPTURE_JPEG_QUALITY = 60
 VISION_NAVIGATION_DEFAULT_CAPTURE_PRESERVE_ASPECT_RATIO = True
 VISION_NAVIGATION_DEFAULT_DECIDE_WAIT_TIMEOUT_SECONDS = 30.0
 VISION_NAVIGATION_DEFAULT_DECIDE_RETRY_COUNT = 1
+MOVEMENT_DECIDER_DEFAULT_DECIDE_WAIT_TIMEOUT_SECONDS = 30.0
+MOVEMENT_DECIDER_DEFAULT_DECIDE_RETRY_COUNT = 1
+MOVEMENT_DECIDER_DEFAULT_DECIDE_POLL_INTERVAL_SECONDS = 0.1
 
 
 class E2ERunnerError(RuntimeError):
@@ -57,6 +60,7 @@ class _LaunchContext:
     process: subprocess.Popen[Any]
     log_path: Path
     log_stream: Any
+    command_line: str
 
 
 def _extract_port_from_base_url(base_url: str) -> int:
@@ -162,6 +166,13 @@ def _start_unreal_if_requested(
     if not args.launch:
         return None
 
+    launch_mode = str(args.launch_mode).strip().lower()
+    launch_extra_args = list(args.extra_arg)
+    if launch_mode == "game":
+        has_game_flag = any(str(arg).strip().lower() == "-game" for arg in launch_extra_args)
+        if not has_game_flag:
+            launch_extra_args.append("-game")
+
     target_port = args.port if args.port is not None else _extract_port_from_base_url(args.base_url)
     command = build_unreal_command(
         unreal_executable=args.unreal_executable,
@@ -170,8 +181,12 @@ def _start_unreal_if_requested(
         port=target_port,
         run_id=run_id,
         scenario=args.scenario,
-        extra_args=args.extra_arg,
+        extra_args=launch_extra_args,
     )
+    if launch_mode == "game":
+        argv = command.get("argv", [])
+        if not any(str(arg).strip().lower() == "-game" for arg in argv):
+            raise E2ERunnerError("launch_mode=game requires '-game' flag in Unreal launch argv.")
 
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / "unreal.log"
@@ -182,7 +197,12 @@ def _start_unreal_if_requested(
         stdout=log_stream,
         stderr=subprocess.STDOUT,
     )
-    return _LaunchContext(process=process, log_path=log_path, log_stream=log_stream)
+    return _LaunchContext(
+        process=process,
+        log_path=log_path,
+        log_stream=log_stream,
+        command_line=str(command.get("command_line", "")),
+    )
 
 
 def _create_step_record(name: str, *, command: str, request_args: Mapping[str, Any]) -> Dict[str, Any]:
@@ -878,6 +898,29 @@ def _validate_vision_navigation_decision(
     return errors
 
 
+def _validate_movement_decider_decision(
+    decision: Mapping[str, Any],
+    *,
+    run_id: str,
+    session_id: str,
+    iteration: int,
+) -> list[str]:
+    errors = _validate_vision_navigation_decision(
+        decision,
+        run_id=run_id,
+        session_id=session_id,
+        iteration=iteration,
+    )
+    filtered_errors = [
+        error
+        for error in errors
+        if not error.startswith("decide.json.success_mode")
+    ]
+    if "phase_completed" in decision and not isinstance(decision.get("phase_completed"), bool):
+        filtered_errors.append("decide.json.phase_completed must be a boolean when provided")
+    return filtered_errors
+
+
 def _normalize_vision_navigation_action(action: Mapping[str, Any]) -> Dict[str, Any]:
     action_name = str(action.get("action", "")).strip()
     args = action.get("args", {})
@@ -996,7 +1039,19 @@ def _run_vision_navigation(
     loop_config = scenario_definition.get("loop", {})
     capture_config = scenario_definition.get("capture", {})
     decision_bridge = scenario_definition.get("decision_bridge", {})
-    if not all(isinstance(item, Mapping) for item in (goal, success_criteria, failure_criteria, loop_config, capture_config, decision_bridge)):
+    decision_policy = scenario_definition.get("decision_policy", {})
+    if not all(
+        isinstance(item, Mapping)
+        for item in (
+            goal,
+            success_criteria,
+            failure_criteria,
+            loop_config,
+            capture_config,
+            decision_bridge,
+            decision_policy,
+        )
+    ):
         raise E2ERunnerError("vision_navigation scenario fields must be objects.")
 
     timeout_seconds = _safe_float(success_criteria.get("timeout_seconds"), 240.0)
@@ -1057,6 +1112,7 @@ def _run_vision_navigation(
         "loop": {"max_iterations": max_iterations, "observe_interval_seconds": observe_interval_seconds, "capture_timeout_seconds": capture_timeout_seconds, "action_timeout_seconds": action_timeout_seconds},
         "capture": {"height": capture_height, "preserve_aspect_ratio": capture_preserve_aspect_ratio, "jpeg_quality": capture_jpeg_quality},
         "decision_bridge": {"mode": "file", "decide_wait_timeout_seconds": decide_wait_timeout_seconds, "decide_retry_count": decide_retry_count, "observe_path": str(observe_path), "decide_path": str(decide_path), "lock_path": str(lock_path)},
+        "decision_policy": dict(decision_policy),
         "iterations": iterations,
         "final_observation": None,
         "final_decision": None,
@@ -1225,6 +1281,7 @@ def _run_vision_navigation(
             "loop": result["vision_navigation"]["loop"],
             "capture": result["vision_navigation"]["capture"],
             "decision_bridge": result["vision_navigation"]["decision_bridge"],
+            "decision_policy": result["vision_navigation"]["decision_policy"],
             "observation": {"player_state": dict(player_state), "spatial_state": dict(spatial_state), "capture": dict(capture_summary), "position_target": dict(goal_position_target) if goal_position_target is not None else None},
         }
         record["observation"] = dict(observe_payload["observation"])
@@ -1268,7 +1325,17 @@ def _run_vision_navigation(
         for action_index, action in enumerate(actions):
             action_name = str(action.get("action", "")).strip()
             normalized_args = _normalize_vision_navigation_action(action)
-            action_record: Dict[str, Any] = {"index": action_index + 1, "action": action_name, "request_args": dict(normalized_args), "accepted": None, "duration_seconds": None, "error_code": None, "error_message": None}
+            action_record: Dict[str, Any] = {
+                "index": action_index + 1,
+                "action": action_name,
+                "request_args": dict(normalized_args),
+                "accepted": None,
+                "duration_seconds": None,
+                "error_code": None,
+                "error_message": None,
+                "trace_id": None,
+                "implementation_status": None,
+            }
             record["actions"].append(action_record)
             _write_vision_navigation_bridge_lock(lock_path, run_id=run_id, session_id=session_id, iteration=iteration, status="acting", details={"action_index": action_index + 1, "action": action_name})
 
@@ -1287,6 +1354,11 @@ def _run_vision_navigation(
             action_record["duration_seconds"] = round(max(0.0, time.monotonic() - started_action), 3)
             action_record["error_code"] = response.get("error_code")
             action_record["error_message"] = response.get("error_message")
+            action_record["trace_id"] = response.get("trace_id")
+            action_record["implementation_status"] = response.get("implementation_status")
+            response_details = response.get("details")
+            if isinstance(response_details, Mapping):
+                action_record["response_details"] = dict(response_details)
             if action_timeout_seconds > 0.0 and action_record["duration_seconds"] > action_timeout_seconds:
                 _fail("action_timeout_exceeded", f"{action_name} exceeded action_timeout_seconds ({action_timeout_seconds}).", details={"iteration": iteration, "action_index": action_index + 1, "duration_seconds": action_record["duration_seconds"]}, response=response, record=record)
             if not action_record["accepted"]:
@@ -1353,6 +1425,8 @@ def _run_movement_jump_sequence(
     client: UnrealTestClient,
     result: Dict[str, Any],
     *,
+    run_id: str,
+    run_dir: Path,
     session_id: str,
     scenario_definition: Mapping[str, Any],
     poll_interval: float,
@@ -1417,6 +1491,9 @@ def _run_movement_jump_sequence(
     pulse_duration_ms = max(50, int(round(pulse_interval_seconds * 1000.0)))
     jump_duration_ms = max(50, _safe_int(sequence.get("jump_duration_ms"), 120))
     jump_settle_seconds = max(0.0, _safe_float(sequence.get("jump_settle_seconds"), 0.2))
+    decision_mode = str(sequence.get("decision_mode", "sequential")).strip().lower() or "sequential"
+    decision_bridge_raw = sequence.get("decision_bridge", {})
+    decision_bridge = dict(decision_bridge_raw) if isinstance(decision_bridge_raw, Mapping) else {}
 
     step = _create_step_record(
         "movement_jump_sequence",
@@ -1425,6 +1502,7 @@ def _run_movement_jump_sequence(
             "camera_lock_stick_id": camera_lock_stick_id,
             "move_stick_id": move_stick_id,
             "jump_button_id": jump_button_id,
+            "decision_mode": decision_mode,
             "pulse_interval_seconds": pulse_interval_seconds,
             "phases": phase_plan,
         },
@@ -1443,6 +1521,7 @@ def _run_movement_jump_sequence(
             "camera_lock_stick_id": camera_lock_stick_id,
             "move_stick_id": move_stick_id,
             "jump_button_id": jump_button_id,
+            "decision_mode": decision_mode,
             "phases": phase_plan,
         },
     }
@@ -1570,6 +1649,261 @@ def _run_movement_jump_sequence(
             "release_stick",
             {"stick_id": move_stick_id},
         )
+
+    if decision_mode == "decider":
+        bridge_paths = _build_vision_navigation_bridge_paths(run_dir, session_id)
+        bridge_dir = bridge_paths["bridge_dir"]
+        observe_path = bridge_paths["observe_path"]
+        decide_path = bridge_paths["decide_path"]
+        lock_path = bridge_paths["lock_path"]
+        bridge_dir.mkdir(parents=True, exist_ok=True)
+
+        decide_wait_timeout_seconds = max(
+            1.0,
+            _safe_float(
+                decision_bridge.get("decide_wait_timeout_seconds"),
+                MOVEMENT_DECIDER_DEFAULT_DECIDE_WAIT_TIMEOUT_SECONDS,
+            ),
+        )
+        decide_retry_count = max(
+            0,
+            _safe_int(
+                decision_bridge.get("decide_retry_count"),
+                MOVEMENT_DECIDER_DEFAULT_DECIDE_RETRY_COUNT,
+            ),
+        )
+        decide_poll_interval_seconds = max(
+            0.02,
+            _safe_float(
+                decision_bridge.get("decide_poll_interval_seconds"),
+                MOVEMENT_DECIDER_DEFAULT_DECIDE_POLL_INTERVAL_SECONDS,
+            ),
+        )
+
+        observation["bridge"] = {
+            "mode": "file",
+            "observe_path": str(observe_path),
+            "decide_path": str(decide_path),
+            "lock_path": str(lock_path),
+            "decide_wait_timeout_seconds": decide_wait_timeout_seconds,
+            "decide_retry_count": decide_retry_count,
+            "decide_poll_interval_seconds": decide_poll_interval_seconds,
+        }
+        result["notes"].append(f"movement_decider_bridge_dir:{bridge_dir}")
+        _write_vision_navigation_bridge_lock(
+            lock_path,
+            run_id=run_id,
+            session_id=session_id,
+            iteration=0,
+            status="initialized",
+            details={"intent": SUPPORTED_MOVEMENT_INTENT},
+        )
+
+        def _wait_for_decision(iteration: int) -> Mapping[str, Any]:
+            validation_failures = 0
+            decision_deadline = time.monotonic() + decide_wait_timeout_seconds
+            while time.monotonic() < decision_deadline:
+                _check_timeout()
+                if not decide_path.exists():
+                    time.sleep(decide_poll_interval_seconds)
+                    continue
+                try:
+                    decision_payload = json.loads(decide_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    validation_failures += 1
+                    if validation_failures > decide_retry_count:
+                        _fail_sequence(
+                            "decision_validation_failed",
+                            "Movement decider decision payload is invalid.",
+                            details={"iteration": iteration},
+                        )
+                    time.sleep(decide_poll_interval_seconds)
+                    continue
+                if not isinstance(decision_payload, Mapping):
+                    validation_failures += 1
+                    if validation_failures > decide_retry_count:
+                        _fail_sequence(
+                            "decision_validation_failed",
+                            "Movement decider decision payload must be an object.",
+                            details={"iteration": iteration},
+                        )
+                    time.sleep(decide_poll_interval_seconds)
+                    continue
+                validation_errors = _validate_movement_decider_decision(
+                    decision_payload,
+                    run_id=run_id,
+                    session_id=session_id,
+                    iteration=iteration,
+                )
+                if validation_errors:
+                    validation_failures += 1
+                    if validation_failures > decide_retry_count:
+                        _fail_sequence(
+                            "decision_validation_failed",
+                            "Movement decider decision validation failed.",
+                            details={"iteration": iteration, "errors": validation_errors},
+                        )
+                    time.sleep(decide_poll_interval_seconds)
+                    continue
+                return dict(decision_payload)
+            _fail_sequence(
+                "decision_timeout",
+                f"Timed out waiting for decide.json after {decide_wait_timeout_seconds} seconds.",
+                details={"iteration": iteration},
+            )
+
+        _send_with_retry(
+            "camera_lock_center",
+            "move_stick",
+            {"stick_id": camera_lock_stick_id, "x": 0.0, "y": 0.0, "duration_ms": 100},
+        )
+        _send_with_retry("camera_lock_release", "release_stick", {"stick_id": camera_lock_stick_id})
+
+        for phase_index, phase in enumerate(phase_plan):
+            _check_timeout()
+            iteration = phase_index + 1
+            decide_path.unlink(missing_ok=True)
+
+            phase_name = str(phase.get("name", f"phase_{iteration}")).strip() or f"phase_{iteration}"
+            try:
+                player_state = client.get_player_state(session_id=session_id)
+                spatial_state = client.get_spatial_state(session_id=session_id)
+            except UnrealTestClientError as exc:
+                _fail_sequence(
+                    "state_query_failed",
+                    f"Failed to read state before decision: {exc}",
+                    details={"iteration": iteration, "phase_name": phase_name},
+                )
+
+            observe_payload: Dict[str, Any] = {
+                "schema_version": 1,
+                "kind": "movement_jump_observe",
+                "run_id": run_id,
+                "session_id": session_id,
+                "iteration": iteration,
+                "captured_at_utc": utc_now_iso(),
+                "intent": SUPPORTED_MOVEMENT_INTENT,
+                "sequence": {
+                    "phase_count": len(phase_plan),
+                    "phase_index": phase_index,
+                    "phase_name": phase_name,
+                    "phase": dict(phase),
+                    "camera_lock_stick_id": camera_lock_stick_id,
+                    "move_stick_id": move_stick_id,
+                    "jump_button_id": jump_button_id,
+                    "jump_duration_ms": jump_duration_ms,
+                    "jump_settle_seconds": jump_settle_seconds,
+                    "pulse_interval_seconds": pulse_interval_seconds,
+                },
+                "success_criteria": {
+                    "timeout_seconds": timeout_seconds,
+                    "completion_state": "sequence_completed",
+                },
+                "failure_criteria": {
+                    "input_failure_limit": input_failure_limit,
+                },
+                "decision_bridge": dict(observation.get("bridge", {})),
+                "observation": {
+                    "player_state": dict(player_state) if isinstance(player_state, Mapping) else {},
+                    "spatial_state": dict(spatial_state) if isinstance(spatial_state, Mapping) else {},
+                    "command_log_size": len(command_log),
+                },
+            }
+            _write_json(observe_path, observe_payload)
+            _write_vision_navigation_bridge_lock(
+                lock_path,
+                run_id=run_id,
+                session_id=session_id,
+                iteration=iteration,
+                status="waiting_for_decision",
+                details={"phase_name": phase_name},
+            )
+
+            decision_payload = _wait_for_decision(iteration)
+            decision_status = str(decision_payload.get("status", "")).strip().lower()
+            if decision_status == "failure":
+                _fail_sequence(
+                    "decision_failure",
+                    str(
+                        decision_payload.get(
+                            "reason",
+                            f"Movement decider reported failure at {phase_name}.",
+                        )
+                    ),
+                    details={"iteration": iteration, "phase_name": phase_name},
+                )
+
+            actions = decision_payload.get("actions", [])
+            if not isinstance(actions, Sequence) or isinstance(actions, (str, bytes)):
+                _fail_sequence(
+                    "decision_validation_failed",
+                    "Movement decider actions must be an array.",
+                    details={"iteration": iteration},
+                )
+
+            for action_index, action in enumerate(actions):
+                action_name = str(action.get("action", "")).strip()
+                normalized_args = _normalize_vision_navigation_action(action)
+                action_log_name = (
+                    f"decider_phase_{iteration}_{phase_name}_{action_name}_{action_index + 1}"
+                )
+                _write_vision_navigation_bridge_lock(
+                    lock_path,
+                    run_id=run_id,
+                    session_id=session_id,
+                    iteration=iteration,
+                    status="acting",
+                    details={"phase_name": phase_name, "action_index": action_index + 1, "action": action_name},
+                )
+
+                if action_name == "wait":
+                    wait_seconds = max(0.0, _safe_float(normalized_args.get("seconds"), 0.0))
+                    time.sleep(wait_seconds)
+                    command_log.append(
+                        {
+                            "name": action_log_name,
+                            "command": "wait",
+                            "request_args": {"seconds": wait_seconds},
+                            "accepted": True,
+                            "duration_seconds": round(wait_seconds, 3),
+                        }
+                    )
+                    continue
+
+                _send_with_retry(action_log_name, action_name, normalized_args)
+                if action_name == "move_stick":
+                    result["checks"]["approach"] = True
+
+            _write_vision_navigation_bridge_lock(
+                lock_path,
+                run_id=run_id,
+                session_id=session_id,
+                iteration=iteration,
+                status="phase_completed",
+                details={"phase_name": phase_name, "decision_status": decision_status},
+            )
+            if decision_status == "success" or bool(decision_payload.get("success", False)):
+                break
+
+        final_player_state = client.get_player_state(session_id=session_id)
+        result["final_state"]["player_state"] = dict(final_player_state)
+        result["success"]["success_condition"] = "sequence_completed"
+        result["checks"]["scenario_flow"] = True
+        _write_vision_navigation_bridge_lock(
+            lock_path,
+            run_id=run_id,
+            session_id=session_id,
+            iteration=len(phase_plan),
+            status="completed",
+            details={"success_condition": "sequence_completed"},
+        )
+        _finalize_step_record(
+            step,
+            status="passed",
+            observation=observation,
+            started_at_monotonic=step_started_at_monotonic,
+        )
+        return
 
     _send_with_retry(
         "camera_lock_center",
@@ -1969,6 +2303,7 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
     report_path = run_dir / "report.json"
     mode = "launch" if args.launch else "attach"
 
+    launch_mode = str(args.launch_mode).strip().lower()
     result: Dict[str, Any] = {
         "ok": False,
         "run_id": run_id,
@@ -1979,7 +2314,11 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
         "started_at_utc": utc_now_iso(),
         "ended_at_utc": None,
         "duration_seconds": None,
-        "launch": {"enabled": bool(args.launch), "mode": mode},
+        "launch": {
+            "enabled": bool(args.launch),
+            "mode": mode,
+            "launch_mode": launch_mode if bool(args.launch) else None,
+        },
         "checks": {
             "health": False,
             "capabilities": False,
@@ -2058,6 +2397,7 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
         if launch_ctx is not None:
             result["launch"]["pid"] = launch_ctx.process.pid
             result["launch"]["log_path"] = str(launch_ctx.log_path)
+            result["launch"]["command_line"] = launch_ctx.command_line
             result["artifacts"]["log_path"] = str(launch_ctx.log_path)
 
         health = _wait_until_healthy(client, timeout=args.health_timeout, poll_interval=args.poll_interval)
@@ -2072,11 +2412,17 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
         }
         result["checks"]["capabilities"] = True
 
+        effective_auto_play_editor = bool(args.auto_play_editor)
+        if bool(args.launch) and launch_mode == "game":
+            if effective_auto_play_editor:
+                result["notes"].append("auto_play_editor_forced:false:launch_mode_game")
+            effective_auto_play_editor = False
+
         session_start = client.start_session(
             session_id=session_id,
             run_id=run_id,
             options={
-                "auto_play_editor": bool(args.auto_play_editor),
+                "auto_play_editor": effective_auto_play_editor,
                 "auto_play_wait_seconds": max(0.0, args.auto_play_wait_seconds),
             },
         )
@@ -2096,7 +2442,7 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
             result["notes"].append(f"auto_play_editor_ready:{session_start.get('auto_play_editor_ready')}")
         if session_start.get("auto_play_editor_error"):
             result["notes"].append(f"auto_play_editor_error:{session_start.get('auto_play_editor_error')}")
-        if args.auto_play_editor and not auto_play_status_available:
+        if effective_auto_play_editor and not auto_play_status_available:
             result["notes"].append("auto_play_editor_status_unavailable:server_may_be_stale")
             if args.require_auto_play_editor:
                 raise E2ERunnerError(
@@ -2221,6 +2567,8 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
             _run_movement_jump_sequence(
                 client,
                 result,
+                run_id=run_id,
+                run_dir=run_dir,
                 session_id=session_id,
                 scenario_definition=scenario_definition,
                 poll_interval=args.poll_interval,
@@ -2719,6 +3067,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
 
     parser.add_argument("--launch", action="store_true", help="Launch UnrealEditor with -TestMode before the E2E run.")
+    parser.add_argument(
+        "--launch-mode",
+        choices=("game", "editor"),
+        default="game",
+        help="Launch mode when --launch is enabled (default: game).",
+    )
     parser.add_argument("--unreal-executable", default=DEFAULT_UNREAL_EXECUTABLE, help="Path to UnrealEditor executable.")
     parser.add_argument("--uproject", default=DEFAULT_UPROJECT, help="Path to .uproject file.")
     parser.add_argument("--port", type=int, default=None, help="Port override used when --launch is enabled.")

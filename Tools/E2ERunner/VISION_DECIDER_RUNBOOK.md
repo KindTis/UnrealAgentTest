@@ -104,16 +104,51 @@ tmp.replace(decide_path)
 
 ---
 
-## 5. 의사결정 정책(최소 규칙)
+## 5. 의사결정 정책 정규화(`decision_policy`)
 
-- 목표 물체(예: 빨간 기둥)가 중앙 부근에서 명확히 보이면:
-  - `status="success"`, `success=true`, `actions=[]`
-- 목표가 보이나 중앙이 아니면:
-  - `camera_yaw` 소각도 + `wait`
-- 목표가 안 보이면:
-  - `camera_yaw` 스윕(±60~120) + `wait`
-- 여러 회차 미탐지면:
-  - `move_stick(left_stick)` 전진 + `release_stick` 후 재탐색
+모델별 편차를 줄이려면 시나리오에 `decision_policy`를 선언하고, decider는 이를 강제로 적용합니다.
+
+핵심 필드:
+
+- `mode`: `strict | advisory`
+- `target_missing.strategy`: `llm | scan_yaw`
+- `target_missing.scan_step_degrees`
+- `target_missing.scan_duration_ms`
+- `target_missing.wait_seconds`
+- `target_found.strategy`: `llm | success_after_wait`
+- `target_found.success_wait_seconds`
+- `guardrails.require_image_observation`
+- `guardrails.max_actions_per_iteration`
+
+`strict` 모드 동작:
+
+- LLM이 다른 액션을 내도 `target_missing/target_found` 정책으로 정규화합니다.
+- 따라서 어떤 모델을 쓰더라도 실행 흐름이 일관됩니다.
+
+빨간 기둥 예시 정책:
+
+```json
+{
+  "decision_policy": {
+    "policy_version": 1,
+    "mode": "strict",
+    "target_missing": {
+      "strategy": "scan_yaw",
+      "scan_step_degrees": 45.0,
+      "scan_duration_ms": 120,
+      "wait_seconds": 0.0
+    },
+    "target_found": {
+      "strategy": "success_after_wait",
+      "success_wait_seconds": 1.0
+    },
+    "guardrails": {
+      "require_image_observation": true,
+      "max_actions_per_iteration": 3
+    }
+  }
+}
+```
 
 금지:
 
@@ -167,4 +202,3 @@ tmp.replace(decide_path)
 - [ ] decide는 원자적 저장(tmp->replace)
 - [ ] lock/observe 읽기 실패 시 재시도(즉시 실패 금지)
 - [ ] `report.json` 종료 상태 확인 후 결과 보고
-

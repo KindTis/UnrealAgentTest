@@ -54,3 +54,17 @@ python Tools/E2ERunner/bridge_decider_llm.py --bridge-dir .\Artifacts\E2ERunner\
 - observe: `Artifacts/E2ERunner/runs/<run_id>/bridge/<session_id>/observe.json`
 - decide: `Artifacts/E2ERunner/runs/<run_id>/bridge/<session_id>/decide.json`
 - report: `Artifacts/E2ERunner/runs/<run_id>/report.json`
+
+## 5) 정책 정규화(`decision_policy`)
+
+하드코딩 대신 시나리오의 `decision_policy`를 읽어 모델 출력을 정규화합니다.
+
+- `mode=strict`이면 LLM 출력이 달라도 정책 액션으로 강제합니다.
+- `mode=advisory`이면 LLM 출력을 우선하고 guardrail만 적용합니다.
+- `target_missing.strategy=scan_yaw`를 쓰면 탐색 회전을 고정할 수 있습니다.
+- `target_found.strategy=success_after_wait`를 쓰면 성공 직전 대기 시간을 고정할 수 있습니다.
+
+예시(빨간 기둥):
+
+- 미탐지: `scan_yaw`, `scan_step_degrees=45`
+- 탐지: `success_after_wait`, `success_wait_seconds=1.0`

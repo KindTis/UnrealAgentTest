@@ -407,19 +407,14 @@ namespace
 
 		const FRotator BeforeRotation = PlayerController->GetControlRotation();
 		const float DeltaYaw = static_cast<float>(Degrees);
-		APawn* Pawn = PlayerController->GetPawn();
-		if (Pawn != nullptr)
-		{
-			Pawn->AddControllerYawInput(DeltaYaw);
-		}
 
-		FRotator AfterRotation = PlayerController->GetControlRotation();
-		AfterRotation.Yaw = FRotator::NormalizeAxis(AfterRotation.Yaw + DeltaYaw);
+		FRotator AfterRotation = BeforeRotation;
+		AfterRotation.Yaw = FRotator::NormalizeAxis(BeforeRotation.Yaw + DeltaYaw);
 		PlayerController->SetControlRotation(AfterRotation);
 
 		SetDetailsString(Details, TEXT("input_mode"), TEXT("camera_yaw"));
 		SetDetailsNumber(Details, TEXT("applied_degrees"), Degrees);
-		SetDetailsBool(Details, TEXT("used_pawn_add_controller_yaw_input"), Pawn != nullptr);
+		SetDetailsBool(Details, TEXT("applied_via_set_control_rotation"), true);
 		SetDetailsNumber(Details, TEXT("before_yaw"), BeforeRotation.Yaw);
 		SetDetailsNumber(Details, TEXT("after_yaw"), AfterRotation.Yaw);
 		return true;

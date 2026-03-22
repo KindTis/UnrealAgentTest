@@ -37,6 +37,24 @@
     "decide_wait_timeout_seconds": 30.0,
     "decide_retry_count": 1
   },
+  "decision_policy": {
+    "policy_version": 1,
+    "mode": "strict",
+    "target_missing": {
+      "strategy": "scan_yaw",
+      "scan_step_degrees": 45.0,
+      "scan_duration_ms": 120,
+      "wait_seconds": 0.0
+    },
+    "target_found": {
+      "strategy": "success_after_wait",
+      "success_wait_seconds": 1.0
+    },
+    "guardrails": {
+      "require_image_observation": true,
+      "max_actions_per_iteration": 3
+    }
+  },
   "termination": {
     "mode": "keep_running"
   }

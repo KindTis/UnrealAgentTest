@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_text": "카메라를 정면으로 고정하고, 정면으로 2초 이동 후 점프하고, 뒤로 2초 이동한다.",
+  "source_text": "카메라를 정면으로 고정하고, 정면으로 2초 이동 후 점프하고, 뒤로 2초 이동합니다.",
   "language": "ko",
   "intent": "movement_jump_sequence",
   "sequence": {
@@ -14,7 +14,8 @@
     "move_x": 0.0,
     "forward_y": 1.0,
     "backward_y": -1.0,
-    "pulse_interval_seconds": 0.1
+    "pulse_interval_seconds": 0.1,
+    "decision_mode": "sequential"
   },
   "success_criteria": {
     "timeout_seconds": 20,

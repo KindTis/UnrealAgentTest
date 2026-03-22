@@ -16,10 +16,15 @@ SUPPORTED_INTENTS = (
 SUPPORTED_SELECTOR_TYPE = "forward_cone"
 SUPPORTED_TARGET_KIND = "monster"
 SUPPORTED_MOVEMENT_COMPLETION_STATE = "sequence_completed"
+SUPPORTED_MOVEMENT_DECISION_MODES = ("sequential", "decider")
+SUPPORTED_MOVEMENT_DECISION_BRIDGE_MODE = "file"
 SUPPORTED_WORKFLOW_COMPLETION_STATE = "steps_completed"
 SUPPORTED_VISION_NAVIGATION_COMPLETION_STATE = "goal_reached"
 SUPPORTED_VISION_NAVIGATION_SUCCESS_MODES = ("position", "visual", "hybrid")
 SUPPORTED_VISION_NAVIGATION_DECISION_BRIDGE_MODE = "file"
+SUPPORTED_VISION_NAVIGATION_DECISION_POLICY_MODES = ("strict", "advisory")
+SUPPORTED_VISION_NAVIGATION_TARGET_MISSING_STRATEGIES = ("llm", "scan_yaw")
+SUPPORTED_VISION_NAVIGATION_TARGET_FOUND_STRATEGIES = ("llm", "success_after_wait")
 SUPPORTED_CONDITION_STATES = ("player_state", "target_state", "spatial_state", "success")
 SUPPORTED_CONDITION_OPERATORS = ("eq", "ne", "lt", "lte", "gt", "gte")
 SUPPORTED_WORKFLOW_ACTIONS = ("command", "wait", "move_phase", "move_to_location", "defeat_target")
@@ -306,6 +311,52 @@ def _validate_movement_jump_sequence_scenario(scenario: Mapping[str, Any], error
             errors.append("scenario.sequence.jump_settle_seconds must be a number")
         elif not (0.0 <= float(jump_settle_seconds) <= 5.0):
             errors.append("scenario.sequence.jump_settle_seconds must be in [0.0, 5.0]")
+
+        decision_mode = str(sequence.get("decision_mode", "sequential")).strip().lower()
+        if decision_mode not in SUPPORTED_MOVEMENT_DECISION_MODES:
+            errors.append(
+                "scenario.sequence.decision_mode must be one of "
+                + ", ".join(SUPPORTED_MOVEMENT_DECISION_MODES)
+            )
+
+        decision_bridge = sequence.get("decision_bridge")
+        if decision_bridge is not None:
+            if not isinstance(decision_bridge, Mapping):
+                errors.append("scenario.sequence.decision_bridge must be an object when provided")
+            else:
+                bridge_mode = decision_bridge.get("mode", SUPPORTED_MOVEMENT_DECISION_BRIDGE_MODE)
+                if bridge_mode != SUPPORTED_MOVEMENT_DECISION_BRIDGE_MODE:
+                    errors.append(
+                        "scenario.sequence.decision_bridge.mode must be "
+                        + SUPPORTED_MOVEMENT_DECISION_BRIDGE_MODE
+                    )
+                if "decide_wait_timeout_seconds" in decision_bridge:
+                    _validate_number_range(
+                        decision_bridge.get("decide_wait_timeout_seconds"),
+                        errors,
+                        "scenario.sequence.decision_bridge",
+                        field_name="decide_wait_timeout_seconds",
+                        minimum=1.0,
+                        maximum=600.0,
+                    )
+                if "decide_retry_count" in decision_bridge:
+                    _validate_int_range(
+                        decision_bridge.get("decide_retry_count"),
+                        errors,
+                        "scenario.sequence.decision_bridge",
+                        field_name="decide_retry_count",
+                        minimum=0,
+                        maximum=20,
+                    )
+                if "decide_poll_interval_seconds" in decision_bridge:
+                    _validate_number_range(
+                        decision_bridge.get("decide_poll_interval_seconds"),
+                        errors,
+                        "scenario.sequence.decision_bridge",
+                        field_name="decide_poll_interval_seconds",
+                        minimum=0.01,
+                        maximum=5.0,
+                    )
     else:
         errors.append("scenario.sequence must be an object")
 
@@ -776,6 +827,111 @@ def _validate_vision_navigation_decision_bridge(
     )
 
 
+def _validate_vision_navigation_decision_policy(
+    decision_policy: Mapping[str, Any],
+    errors: list[str],
+) -> None:
+    if not isinstance(decision_policy, Mapping):
+        errors.append("scenario.decision_policy must be an object when provided")
+        return
+
+    if "policy_version" in decision_policy:
+        _validate_int_range(
+            decision_policy.get("policy_version"),
+            errors,
+            "scenario.decision_policy",
+            field_name="policy_version",
+            minimum=1,
+            maximum=10,
+        )
+
+    if "mode" in decision_policy:
+        mode = decision_policy.get("mode")
+        if mode not in SUPPORTED_VISION_NAVIGATION_DECISION_POLICY_MODES:
+            errors.append(
+                "scenario.decision_policy.mode must be one of strict, advisory"
+            )
+
+    target_missing = decision_policy.get("target_missing")
+    if target_missing is not None:
+        if not isinstance(target_missing, Mapping):
+            errors.append("scenario.decision_policy.target_missing must be an object when provided")
+        else:
+            strategy = target_missing.get("strategy")
+            if strategy is not None and strategy not in SUPPORTED_VISION_NAVIGATION_TARGET_MISSING_STRATEGIES:
+                errors.append(
+                    "scenario.decision_policy.target_missing.strategy must be one of llm, scan_yaw"
+                )
+            if "scan_step_degrees" in target_missing:
+                _validate_number_range(
+                    target_missing.get("scan_step_degrees"),
+                    errors,
+                    "scenario.decision_policy.target_missing",
+                    field_name="scan_step_degrees",
+                    minimum=-180.0,
+                    maximum=180.0,
+                )
+            if "scan_duration_ms" in target_missing:
+                _validate_int_range(
+                    target_missing.get("scan_duration_ms"),
+                    errors,
+                    "scenario.decision_policy.target_missing",
+                    field_name="scan_duration_ms",
+                    minimum=10,
+                    maximum=5000,
+                )
+            if "wait_seconds" in target_missing:
+                _validate_number_range(
+                    target_missing.get("wait_seconds"),
+                    errors,
+                    "scenario.decision_policy.target_missing",
+                    field_name="wait_seconds",
+                    minimum=0.0,
+                    maximum=30.0,
+                )
+
+    target_found = decision_policy.get("target_found")
+    if target_found is not None:
+        if not isinstance(target_found, Mapping):
+            errors.append("scenario.decision_policy.target_found must be an object when provided")
+        else:
+            strategy = target_found.get("strategy")
+            if strategy is not None and strategy not in SUPPORTED_VISION_NAVIGATION_TARGET_FOUND_STRATEGIES:
+                errors.append(
+                    "scenario.decision_policy.target_found.strategy must be one of llm, success_after_wait"
+                )
+            if "success_wait_seconds" in target_found:
+                _validate_number_range(
+                    target_found.get("success_wait_seconds"),
+                    errors,
+                    "scenario.decision_policy.target_found",
+                    field_name="success_wait_seconds",
+                    minimum=0.0,
+                    maximum=30.0,
+                )
+
+    guardrails = decision_policy.get("guardrails")
+    if guardrails is not None:
+        if not isinstance(guardrails, Mapping):
+            errors.append("scenario.decision_policy.guardrails must be an object when provided")
+        else:
+            if "require_image_observation" in guardrails and not isinstance(
+                guardrails.get("require_image_observation"), bool
+            ):
+                errors.append(
+                    "scenario.decision_policy.guardrails.require_image_observation must be a boolean"
+                )
+            if "max_actions_per_iteration" in guardrails:
+                _validate_int_range(
+                    guardrails.get("max_actions_per_iteration"),
+                    errors,
+                    "scenario.decision_policy.guardrails",
+                    field_name="max_actions_per_iteration",
+                    minimum=1,
+                    maximum=10,
+                )
+
+
 def validate_scenario(scenario: Mapping[str, Any]) -> list[str]:
     errors: list[str] = []
 
@@ -833,5 +989,9 @@ def validate_scenario(scenario: Mapping[str, Any]) -> list[str]:
             _validate_vision_navigation_decision_bridge(decision_bridge, errors)
         else:
             errors.append("scenario.decision_bridge is required")
+
+        decision_policy = scenario.get("decision_policy")
+        if decision_policy is not None:
+            _validate_vision_navigation_decision_policy(decision_policy, errors)
 
     return errors

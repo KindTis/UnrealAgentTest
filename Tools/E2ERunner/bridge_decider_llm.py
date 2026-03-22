@@ -15,6 +15,9 @@ class BridgeDeciderError(RuntimeError):
 ALLOWED_ACTIONS = {"move_stick", "release_stick", "tap_button", "wait", "camera_yaw"}
 ALLOWED_STATUSES = {"continue", "success", "failure"}
 ALLOWED_SUCCESS_MODES = {"position", "visual", "hybrid"}
+SUPPORTED_POLICY_MODES = {"strict", "advisory"}
+SUPPORTED_TARGET_MISSING_STRATEGIES = {"llm", "scan_yaw"}
+SUPPORTED_TARGET_FOUND_STRATEGIES = {"llm", "success_after_wait"}
 
 
 def _safe_float(value: Any, fallback: float) -> float:
@@ -168,6 +171,110 @@ def _validate_decision_schema(decision: Mapping[str, Any], *, run_id: str, sessi
     }
 
 
+def _extract_decision_policy(observe_payload: Mapping[str, Any]) -> Dict[str, Any]:
+    raw = observe_payload.get("decision_policy")
+    policy = raw if isinstance(raw, Mapping) else {}
+
+    mode = str(policy.get("mode", "advisory")).strip().lower() or "advisory"
+    if mode not in SUPPORTED_POLICY_MODES:
+        mode = "advisory"
+
+    target_missing_raw = policy.get("target_missing")
+    target_missing = target_missing_raw if isinstance(target_missing_raw, Mapping) else {}
+    target_missing_strategy = str(target_missing.get("strategy", "llm")).strip().lower() or "llm"
+    if target_missing_strategy not in SUPPORTED_TARGET_MISSING_STRATEGIES:
+        target_missing_strategy = "llm"
+
+    target_found_raw = policy.get("target_found")
+    target_found = target_found_raw if isinstance(target_found_raw, Mapping) else {}
+    target_found_strategy = str(target_found.get("strategy", "llm")).strip().lower() or "llm"
+    if target_found_strategy not in SUPPORTED_TARGET_FOUND_STRATEGIES:
+        target_found_strategy = "llm"
+
+    guardrails_raw = policy.get("guardrails")
+    guardrails = guardrails_raw if isinstance(guardrails_raw, Mapping) else {}
+
+    return {
+        "mode": mode,
+        "target_missing": {
+            "strategy": target_missing_strategy,
+            "scan_step_degrees": _safe_float(target_missing.get("scan_step_degrees"), 45.0),
+            "scan_duration_ms": _safe_int(target_missing.get("scan_duration_ms"), 120),
+            "wait_seconds": max(0.0, _safe_float(target_missing.get("wait_seconds"), 0.0)),
+        },
+        "target_found": {
+            "strategy": target_found_strategy,
+            "success_wait_seconds": max(0.0, _safe_float(target_found.get("success_wait_seconds"), 0.0)),
+        },
+        "guardrails": {
+            "require_image_observation": bool(guardrails.get("require_image_observation", True)),
+            "max_actions_per_iteration": max(1, _safe_int(guardrails.get("max_actions_per_iteration"), 4)),
+        },
+    }
+
+
+def _apply_decision_policy(
+    observe_payload: Mapping[str, Any],
+    decision: Mapping[str, Any],
+) -> Dict[str, Any]:
+    policy = _extract_decision_policy(observe_payload)
+    mode = str(policy.get("mode", "advisory")).strip().lower()
+    if mode not in SUPPORTED_POLICY_MODES:
+        mode = "advisory"
+
+    normalized = dict(decision)
+    status = str(normalized.get("status", "continue")).strip().lower()
+    if status not in ALLOWED_STATUSES:
+        status = "continue"
+        normalized["status"] = status
+    if status == "success":
+        normalized["success"] = True
+    elif status in {"continue", "failure"}:
+        normalized["success"] = False
+
+    actions_raw = normalized.get("actions", [])
+    actions: list[Dict[str, Any]]
+    if isinstance(actions_raw, list):
+        actions = []
+        for action in actions_raw:
+            if isinstance(action, Mapping):
+                action_name = str(action.get("action", "")).strip()
+                if action_name in ALLOWED_ACTIONS:
+                    args = action.get("args", {})
+                    if isinstance(args, Mapping):
+                        actions.append({"action": action_name, "args": dict(args)})
+                    else:
+                        actions.append({"action": action_name, "args": {}})
+    else:
+        actions = []
+
+    if mode == "strict" and status != "failure":
+        if status == "success" or bool(normalized.get("success", False)):
+            target_found = policy.get("target_found", {})
+            if str(target_found.get("strategy", "llm")).strip().lower() == "success_after_wait":
+                wait_seconds = max(0.0, _safe_float(target_found.get("success_wait_seconds"), 0.0))
+                if wait_seconds > 0.0:
+                    actions = [{"action": "wait", "args": {"seconds": wait_seconds}}]
+                else:
+                    actions = []
+        elif status == "continue":
+            target_missing = policy.get("target_missing", {})
+            if str(target_missing.get("strategy", "llm")).strip().lower() == "scan_yaw":
+                step_degrees = _safe_float(target_missing.get("scan_step_degrees"), 45.0)
+                duration_ms = _safe_int(target_missing.get("scan_duration_ms"), 120)
+                wait_seconds = max(0.0, _safe_float(target_missing.get("wait_seconds"), 0.0))
+                actions = [{"action": "camera_yaw", "args": {"degrees": step_degrees, "duration_ms": duration_ms}}]
+                if wait_seconds > 0.0:
+                    actions.append({"action": "wait", "args": {"seconds": wait_seconds}})
+
+    max_actions = max(1, _safe_int(policy.get("guardrails", {}).get("max_actions_per_iteration"), 4))
+    if len(actions) > max_actions:
+        actions = actions[:max_actions]
+
+    normalized["actions"] = actions
+    return normalized
+
+
 def _fallback_decision(*, run_id: str, session_id: str, iteration: int, error_text: str, fallback_yaw_degrees: float) -> Dict[str, Any]:
     return {
         "schema_version": 1,
@@ -229,13 +336,21 @@ def _build_system_prompt() -> str:
         "}\n"
         "Rules:\n"
         "1) Keep actions short and safe (<= 3 actions).\n"
-        "2) If target is not found, prefer camera_yaw scan.\n"
-        "3) If target is found, return status=success with empty actions.\n"
-        "4) Never output markdown or explanations."
+        "2) Use the provided decision_policy as the primary behavior contract.\n"
+        "3) If target is not found, prefer camera_yaw scan unless decision_policy says otherwise.\n"
+        "4) If target is found, return status=success.\n"
+        "5) Never output markdown or explanations."
     )
 
 
-def _build_user_payload(observe: Mapping[str, Any], *, run_id: str, session_id: str, iteration: int) -> Dict[str, Any]:
+def _build_user_payload(
+    observe: Mapping[str, Any],
+    *,
+    run_id: str,
+    session_id: str,
+    iteration: int,
+    decision_policy: Mapping[str, Any],
+) -> Dict[str, Any]:
     observation = observe.get("observation")
     if not isinstance(observation, Mapping):
         observation = {}
@@ -249,8 +364,11 @@ def _build_user_payload(observe: Mapping[str, Any], *, run_id: str, session_id: 
         capture = {}
 
     image_base64 = capture.get("image_base64")
-    if not isinstance(image_base64, str) or not image_base64.strip():
+    require_image = bool(decision_policy.get("guardrails", {}).get("require_image_observation", True))
+    if require_image and (not isinstance(image_base64, str) or not image_base64.strip()):
         raise BridgeDeciderError("observe.json is missing image_base64.")
+    if not isinstance(image_base64, str):
+        image_base64 = ""
 
     viewport_state = capture.get("viewport_state")
     if not isinstance(viewport_state, Mapping):
@@ -265,6 +383,7 @@ def _build_user_payload(observe: Mapping[str, Any], *, run_id: str, session_id: 
             "visual_target": goal.get("visual_target"),
             "position_target": goal.get("position_target"),
         },
+        "decision_policy": dict(decision_policy),
         "player_state": observation.get("player_state"),
         "spatial_state": observation.get("spatial_state"),
         "viewport_state": viewport_state,
@@ -272,7 +391,7 @@ def _build_user_payload(observe: Mapping[str, Any], *, run_id: str, session_id: 
 
     return {
         "text": json.dumps(user_text, ensure_ascii=False, separators=(",", ":")),
-        "image_data_url": f"data:image/jpeg;base64,{image_base64}",
+        "image_data_url": f"data:image/jpeg;base64,{image_base64}" if image_base64 else "",
     }
 
 
@@ -288,6 +407,10 @@ def _call_chat_completions(
     user_payload: Mapping[str, Any],
 ) -> Dict[str, Any]:
     endpoint = api_base_url.rstrip("/") + "/chat/completions"
+    content_blocks: list[Dict[str, Any]] = [{"type": "text", "text": str(user_payload["text"])}]
+    image_data_url = str(user_payload.get("image_data_url", "")).strip()
+    if image_data_url:
+        content_blocks.append({"type": "image_url", "image_url": {"url": image_data_url}})
     body = {
         "model": model,
         "temperature": temperature,
@@ -296,10 +419,7 @@ def _call_chat_completions(
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": user_payload["text"]},
-                    {"type": "image_url", "image_url": {"url": user_payload["image_data_url"]}},
-                ],
+                "content": content_blocks,
             },
         ],
     }
@@ -350,11 +470,13 @@ def _decide_once(
     if not run_id or not session_id or iteration <= 0:
         raise BridgeDeciderError("observe.json is missing run/session/iteration.")
 
+    decision_policy = _extract_decision_policy(observe_payload)
     user_payload = _build_user_payload(
         observe_payload,
         run_id=run_id,
         session_id=session_id,
         iteration=iteration,
+        decision_policy=decision_policy,
     )
     llm_raw = _call_chat_completions(
         api_base_url=api_base_url,
@@ -459,6 +581,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     error_text=error_text,
                 )
 
+        decision = _apply_decision_policy(observe, decision)
         _write_json_atomic(decide_path, decision)
         last_iteration = iteration
 

@@ -558,9 +558,23 @@ void FGameTestRuntimeState::ApplyMoveStick(FSessionRuntimeState& SessionState, c
 {
 	double StickX = 0.0;
 	double StickY = 0.0;
+	double DurationMs = 100.0;
 	(void)TryGetNumberFieldAny(NormalizedArgs, { TEXT("x"), TEXT("recommended_left_stick_x") }, StickX);
 	(void)TryGetNumberFieldAny(NormalizedArgs, { TEXT("y"), TEXT("recommended_left_stick_y") }, StickY);
+	(void)TryGetNumberFieldAny(NormalizedArgs, { TEXT("duration_ms") }, DurationMs);
 	SetExplicitLeftStick(SessionState, StickX, StickY);
+
+	// Runtime state keeps a lightweight kinematic approximation for state-driven flow tests.
+	const double DurationSeconds = FMath::Clamp(DurationMs / 1000.0, 0.01, 2.0);
+	constexpr double MoveSpeedCmPerSec = 300.0;
+	const FGameTestVector3 Forward = ComputeForwardVector(SessionState.PlayerState.Rotation);
+	const FGameTestVector3 Right = ComputeRightVector(SessionState.PlayerState.Rotation);
+	const double DeltaX = ((Forward.X * StickY) + (Right.X * StickX)) * MoveSpeedCmPerSec * DurationSeconds;
+	const double DeltaY = ((Forward.Y * StickY) + (Right.Y * StickX)) * MoveSpeedCmPerSec * DurationSeconds;
+	const double DeltaZ = ((Forward.Z * StickY) + (Right.Z * StickX)) * MoveSpeedCmPerSec * DurationSeconds;
+	SessionState.PlayerState.Location.X += DeltaX;
+	SessionState.PlayerState.Location.Y += DeltaY;
+	SessionState.PlayerState.Location.Z += DeltaZ;
 	SessionState.PlayerState.CurrentAction = TEXT("move_stick");
 }
 

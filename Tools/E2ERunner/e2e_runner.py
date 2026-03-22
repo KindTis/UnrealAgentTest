@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -25,6 +26,7 @@ from Tools.ParallelRunner.parallel_runner import (  # noqa: E402
 from Tools.E2ERunner.scenario_schema import (  # noqa: E402
     SUPPORTED_DEFEAT_INTENT,
     SUPPORTED_MOVEMENT_INTENT,
+    SUPPORTED_WORKFLOW_INTENT,
     TERMINATION_MODES,
     validate_scenario,
 )
@@ -297,6 +299,67 @@ def _safe_int(value: Any, fallback: int) -> int:
     return fallback
 
 
+def _resolve_path_value(payload: Mapping[str, Any], path: str) -> Any:
+    current: Any = payload
+    for raw_token in path.split("."):
+        token = raw_token.strip()
+        if not token:
+            return None
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(token)
+    return current
+
+
+def _to_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _evaluate_condition(condition: Mapping[str, Any], context: Mapping[str, Any]) -> tuple[bool, Dict[str, Any]]:
+    state_name = str(condition.get("state", "")).strip()
+    path = str(condition.get("path", "")).strip()
+    op = str(condition.get("op", "")).strip().lower()
+    expected = condition.get("value")
+    state_payload_raw = context.get(state_name)
+    state_payload = state_payload_raw if isinstance(state_payload_raw, Mapping) else {}
+    actual = _resolve_path_value(state_payload, path)
+    details = {
+        "state": state_name,
+        "path": path,
+        "op": op,
+        "expected": expected,
+        "actual": actual,
+    }
+
+    if op == "eq":
+        return actual == expected, details
+    if op == "ne":
+        return actual != expected, details
+
+    actual_number = _to_number(actual)
+    expected_number = _to_number(expected)
+    if actual_number is None or expected_number is None:
+        return False, details
+    if op == "lt":
+        return actual_number < expected_number, details
+    if op == "lte":
+        return actual_number <= expected_number, details
+    if op == "gt":
+        return actual_number > expected_number, details
+    if op == "gte":
+        return actual_number >= expected_number, details
+    return False, details
+
+
 def _load_scenario_definition(args: argparse.Namespace, *, run_dir: Path) -> tuple[Dict[str, Any], str]:
     if bool(args.scenario_json) == bool(args.scenario_file):
         raise E2ERunnerError("Provide exactly one of --scenario-json or --scenario-file.")
@@ -386,6 +449,39 @@ def _run_movement_jump_sequence(
     move_x = _safe_float(sequence.get("move_x"), 0.0)
     forward_y = _safe_float(sequence.get("forward_y"), 1.0)
     backward_y = _safe_float(sequence.get("backward_y"), -1.0)
+    phases_raw = sequence.get("phases")
+    phase_plan: list[Dict[str, Any]] = []
+    if isinstance(phases_raw, list) and len(phases_raw) > 0:
+        for index, phase in enumerate(phases_raw):
+            if not isinstance(phase, Mapping):
+                continue
+            phase_name = str(phase.get("name", f"phase_{index + 1}")).strip() or f"phase_{index + 1}"
+            phase_plan.append(
+                {
+                    "name": phase_name,
+                    "move_x": max(-1.0, min(1.0, _safe_float(phase.get("move_x"), 0.0))),
+                    "move_y": max(-1.0, min(1.0, _safe_float(phase.get("move_y"), 0.0))),
+                    "duration_seconds": max(0.1, _safe_float(phase.get("duration_seconds"), 0.1)),
+                    "jump_after": bool(phase.get("jump_after", False)),
+                }
+            )
+    if len(phase_plan) == 0:
+        phase_plan = [
+            {
+                "name": "forward",
+                "move_x": max(-1.0, min(1.0, move_x)),
+                "move_y": max(-1.0, min(1.0, forward_y)),
+                "duration_seconds": max(0.1, forward_seconds),
+                "jump_after": True,
+            },
+            {
+                "name": "backward",
+                "move_x": max(-1.0, min(1.0, move_x)),
+                "move_y": max(-1.0, min(1.0, backward_y)),
+                "duration_seconds": max(0.1, backward_seconds),
+                "jump_after": False,
+            },
+        ]
     pulse_interval_seconds = _safe_float(sequence.get("pulse_interval_seconds"), 0.1)
     pulse_interval_seconds = max(0.05, min(1.0, pulse_interval_seconds))
     pulse_duration_ms = max(50, int(round(pulse_interval_seconds * 1000.0)))
@@ -399,12 +495,8 @@ def _run_movement_jump_sequence(
             "camera_lock_stick_id": camera_lock_stick_id,
             "move_stick_id": move_stick_id,
             "jump_button_id": jump_button_id,
-            "forward_seconds": forward_seconds,
-            "backward_seconds": backward_seconds,
-            "move_x": move_x,
-            "forward_y": forward_y,
-            "backward_y": backward_y,
             "pulse_interval_seconds": pulse_interval_seconds,
+            "phases": phase_plan,
         },
     )
     result["steps"].append(step)
@@ -421,8 +513,7 @@ def _run_movement_jump_sequence(
             "camera_lock_stick_id": camera_lock_stick_id,
             "move_stick_id": move_stick_id,
             "jump_button_id": jump_button_id,
-            "forward_seconds": forward_seconds,
-            "backward_seconds": backward_seconds,
+            "phases": phase_plan,
         },
     }
 
@@ -526,7 +617,7 @@ def _run_movement_jump_sequence(
             details={"input_failure_limit": input_failure_limit},
         )
 
-    def _run_move_phase(phase_name: str, duration_seconds: float, axis_y: float) -> None:
+    def _run_move_phase(phase_name: str, duration_seconds: float, axis_x: float, axis_y: float) -> None:
         phase_started = time.monotonic()
         pulse_index = 0
         while (time.monotonic() - phase_started) < duration_seconds:
@@ -536,7 +627,7 @@ def _run_movement_jump_sequence(
                 "move_stick",
                 {
                     "stick_id": move_stick_id,
-                    "x": move_x,
+                    "x": axis_x,
                     "y": axis_y,
                     "duration_ms": pulse_duration_ms,
                 },
@@ -557,23 +648,379 @@ def _run_movement_jump_sequence(
     )
     _send_with_retry("camera_lock_release", "release_stick", {"stick_id": camera_lock_stick_id})
 
-    _run_move_phase("forward", max(0.1, forward_seconds), forward_y)
+    for phase_index, phase in enumerate(phase_plan):
+        phase_name = str(phase.get("name", f"phase_{phase_index + 1}")).strip() or f"phase_{phase_index + 1}"
+        phase_duration = max(0.1, _safe_float(phase.get("duration_seconds"), 0.1))
+        phase_x = max(-1.0, min(1.0, _safe_float(phase.get("move_x"), 0.0)))
+        phase_y = max(-1.0, min(1.0, _safe_float(phase.get("move_y"), 0.0)))
+        _run_move_phase(phase_name, phase_duration, phase_x, phase_y)
 
-    jump_accepted = _send_sequence_command(
-        "jump",
-        "tap_button",
-        {"button_id": jump_button_id, "duration_ms": jump_duration_ms},
-    )
-    if not jump_accepted:
-        _send_with_retry("jump_retry", "tap_button", {"button_id": jump_button_id, "duration_ms": jump_duration_ms})
-    if jump_settle_seconds > 0:
-        time.sleep(jump_settle_seconds)
-
-    _run_move_phase("backward", max(0.1, backward_seconds), backward_y)
+        if bool(phase.get("jump_after", False)):
+            jump_accepted = _send_sequence_command(
+                f"jump_after_{phase_name}",
+                "tap_button",
+                {"button_id": jump_button_id, "duration_ms": jump_duration_ms},
+            )
+            if not jump_accepted:
+                _send_with_retry(
+                    f"jump_after_{phase_name}_retry",
+                    "tap_button",
+                    {"button_id": jump_button_id, "duration_ms": jump_duration_ms},
+                )
+            if jump_settle_seconds > 0:
+                time.sleep(jump_settle_seconds)
 
     final_player_state = client.get_player_state(session_id=session_id)
     result["final_state"]["player_state"] = dict(final_player_state)
     result["success"]["success_condition"] = "sequence_completed"
+    result["checks"]["scenario_flow"] = True
+    _finalize_step_record(
+        step,
+        status="passed",
+        observation=observation,
+        started_at_monotonic=step_started_at_monotonic,
+    )
+
+
+def _run_workflow_steps(
+    client: UnrealTestClient,
+    result: Dict[str, Any],
+    *,
+    session_id: str,
+    scenario_definition: Mapping[str, Any],
+    poll_interval: float,
+) -> None:
+    steps = scenario_definition.get("steps", [])
+    success_criteria = scenario_definition.get("success_criteria", {})
+    failure_criteria = scenario_definition.get("failure_criteria", {})
+    assertions = scenario_definition.get("assertions", [])
+    if not isinstance(steps, Sequence):
+        raise E2ERunnerError("scenario.steps must be an array.")
+
+    timeout_seconds = _safe_float(
+        success_criteria.get("timeout_seconds") if isinstance(success_criteria, Mapping) else None,
+        60.0,
+    )
+    completion_state = str(
+        success_criteria.get("completion_state") if isinstance(success_criteria, Mapping) else "steps_completed"
+    ).strip() or "steps_completed"
+    input_failure_limit = _safe_int(
+        failure_criteria.get("input_failure_limit") if isinstance(failure_criteria, Mapping) else None,
+        3,
+    )
+
+    step = _create_step_record(
+        "workflow_steps",
+        command="workflow_execute",
+        request_args={
+            "step_count": len(steps),
+            "timeout_seconds": timeout_seconds,
+            "input_failure_limit": input_failure_limit,
+        },
+    )
+    result["steps"].append(step)
+    step_started_at_monotonic = time.monotonic()
+    deadline = step_started_at_monotonic + max(1.0, timeout_seconds)
+    command_log: list[Dict[str, Any]] = []
+    context: Dict[str, Any] = {
+        "player_state": {},
+        "target_state": {},
+        "spatial_state": {},
+        "success": result.get("success", {}),
+    }
+    observation: Dict[str, Any] = {
+        "command_log": command_log,
+        "workflow": {
+            "step_count": len(steps),
+            "timeout_seconds": timeout_seconds,
+            "completion_state": completion_state,
+        },
+        "assertions": [],
+    }
+
+    cursor = _safe_sequence(client.get_events(session_id=session_id, limit=1).get("last_sequence"), 0)
+
+    def _fail_workflow(
+        code: str,
+        message: str,
+        *,
+        details: Optional[Mapping[str, Any]] = None,
+        response: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        failure = _make_failure("workflow_steps", code, message, details=details)
+        _finalize_step_record(
+            step,
+            status="failed",
+            response=response,
+            observation=observation,
+            failure=failure,
+            started_at_monotonic=step_started_at_monotonic,
+        )
+        raise E2ERunnerError(message)
+
+    def _check_timeout() -> None:
+        if time.monotonic() >= deadline:
+            _fail_workflow(
+                "overall_timeout",
+                f"Workflow exceeded timeout ({timeout_seconds} seconds).",
+                details={"timeout_seconds": timeout_seconds},
+            )
+
+    def _refresh_context() -> None:
+        player_state = client.get_player_state(session_id=session_id)
+        target_state = client.get_target_state(session_id=session_id)
+        spatial_state = client.get_spatial_state(session_id=session_id)
+        context["player_state"] = dict(player_state)
+        context["target_state"] = dict(target_state)
+        context["spatial_state"] = dict(spatial_state)
+        context["success"] = dict(result.get("success", {}))
+        result["final_state"]["player_state"] = dict(player_state)
+        result["final_state"]["target_state"] = dict(target_state)
+        result["final_state"]["spatial_state"] = dict(spatial_state)
+
+    def _send_logged_command(name: str, command: str, request_args: Mapping[str, Any]) -> Mapping[str, Any]:
+        consecutive_input_failures = 0
+        while True:
+            _check_timeout()
+            started_at = time.monotonic()
+            response = _send_command(client, session_id=session_id, command=command, request_args=request_args)
+            accepted = bool(response.get("accepted", False))
+            record: Dict[str, Any] = {
+                "name": name,
+                "command": command,
+                "request_args": dict(request_args),
+                "accepted": accepted,
+                "error_code": response.get("error_code"),
+                "error_message": response.get("error_message"),
+                "duration_seconds": round(max(0.0, time.monotonic() - started_at), 3),
+            }
+            details = response.get("details")
+            if isinstance(details, Mapping):
+                input_execution = details.get("input_execution")
+                if isinstance(input_execution, Mapping):
+                    for key in (
+                        "input_key",
+                        "input_mode",
+                        "tap_duration_ms",
+                        "release_scheduled",
+                        "release_delay_seconds",
+                        "jump_fallback_used",
+                    ):
+                        if key in input_execution:
+                            record[key] = input_execution.get(key)
+            command_log.append(record)
+
+            if accepted:
+                return response
+
+            error_code = str(response.get("error_code", "command_rejected"))
+            if error_code == "input_execution_failed":
+                consecutive_input_failures += 1
+                if consecutive_input_failures < max(1, input_failure_limit):
+                    time.sleep(max(0.02, poll_interval))
+                    continue
+                _fail_workflow(
+                    "input_execution_failed_limit",
+                    f"{name} failed repeatedly due to input execution errors.",
+                    details={"input_failure_limit": input_failure_limit},
+                    response=response,
+                )
+            _fail_workflow(
+                error_code,
+                str(response.get("error_message", f"{name} command was rejected.")),
+                details={"error_stage": response.get("error_stage")},
+                response=response,
+            )
+
+    def _run_move_phase(name: str, args: Mapping[str, Any]) -> None:
+        stick_id = str(args.get("stick_id", "left_stick")).strip() or "left_stick"
+        axis_x = max(-1.0, min(1.0, _safe_float(args.get("x"), 0.0)))
+        axis_y = max(-1.0, min(1.0, _safe_float(args.get("y"), 0.0)))
+        duration_seconds = max(0.1, _safe_float(args.get("duration_seconds"), 0.1))
+        pulse_interval = max(0.05, min(1.0, _safe_float(args.get("pulse_interval_seconds"), 0.1)))
+        duration_ms = max(50, _safe_int(args.get("duration_ms"), int(round(pulse_interval * 1000.0))))
+
+        phase_started = time.monotonic()
+        pulse_index = 0
+        while (time.monotonic() - phase_started) < duration_seconds:
+            pulse_index += 1
+            _send_logged_command(
+                f"{name}_move_{pulse_index}",
+                "move_stick",
+                {"stick_id": stick_id, "x": axis_x, "y": axis_y, "duration_ms": duration_ms},
+            )
+            result["checks"]["approach"] = True
+            time.sleep(max(0.01, min(pulse_interval, poll_interval if poll_interval > 0 else pulse_interval)))
+        _send_logged_command(f"{name}_release", "release_stick", {"stick_id": stick_id})
+
+    def _run_move_to_location(name: str, args: Mapping[str, Any]) -> None:
+        target_x = _safe_float(args.get("x"), 0.0)
+        target_y = _safe_float(args.get("y"), 0.0)
+        tolerance_cm = max(1.0, _safe_float(args.get("tolerance_cm"), 30.0))
+        max_seconds = max(0.1, _safe_float(args.get("max_seconds"), 30.0))
+        stick_id = str(args.get("stick_id", "left_stick")).strip() or "left_stick"
+        pulse_interval = max(0.05, min(1.0, _safe_float(args.get("pulse_interval_seconds"), 0.1)))
+        duration_ms = max(50, _safe_int(args.get("duration_ms"), int(round(pulse_interval * 1000.0))))
+        phase_deadline = time.monotonic() + max_seconds
+        pulse_index = 0
+
+        while True:
+            _check_timeout()
+            if time.monotonic() >= phase_deadline:
+                _send_logged_command(f"{name}_release", "release_stick", {"stick_id": stick_id})
+                _fail_workflow(
+                    "move_to_location_timeout",
+                    f"{name} could not reach target location within {max_seconds} seconds.",
+                    details={
+                        "target_x": target_x,
+                        "target_y": target_y,
+                        "tolerance_cm": tolerance_cm,
+                    },
+                )
+
+            _refresh_context()
+            player_state = context.get("player_state", {})
+            if not isinstance(player_state, Mapping):
+                player_state = {}
+            location = player_state.get("location", {})
+            if not isinstance(location, Mapping):
+                location = {}
+            current_x = _safe_float(location.get("x"), 0.0)
+            current_y = _safe_float(location.get("y"), 0.0)
+            delta_x = target_x - current_x
+            delta_y = target_y - current_y
+            distance_cm = math.hypot(delta_x, delta_y)
+            if distance_cm <= tolerance_cm:
+                _send_logged_command(f"{name}_release", "release_stick", {"stick_id": stick_id})
+                return
+
+            norm = max(distance_cm, 1e-6)
+            stick_y = max(-1.0, min(1.0, delta_x / norm))
+            stick_x = max(-1.0, min(1.0, delta_y / norm))
+            pulse_index += 1
+            _send_logged_command(
+                f"{name}_move_to_{pulse_index}",
+                "move_stick",
+                {"stick_id": stick_id, "x": stick_x, "y": stick_y, "duration_ms": duration_ms},
+            )
+            result["checks"]["approach"] = True
+            time.sleep(max(0.01, min(pulse_interval, poll_interval if poll_interval > 0 else pulse_interval)))
+
+    def _run_defeat_target(name: str, args: Mapping[str, Any]) -> None:
+        nonlocal cursor
+        attack_max_attempts = max(1, _safe_int(args.get("attack_max_attempts"), 12))
+        attack_interval_seconds = max(0.0, _safe_float(args.get("attack_interval_seconds"), 0.15))
+        post_attack_settle_seconds = max(0.0, _safe_float(args.get("post_attack_settle_seconds"), 0.1))
+        for attack_index in range(attack_max_attempts):
+            _check_timeout()
+            _send_logged_command(f"{name}_attack_{attack_index + 1}", "attack", dict(args.get("command_args", {})))
+            result["checks"]["attack"] = True
+            if post_attack_settle_seconds > 0:
+                time.sleep(post_attack_settle_seconds)
+            _refresh_context()
+            target_state = context.get("target_state", {})
+            if isinstance(target_state, Mapping) and not bool(target_state.get("alive", True)):
+                result["success"]["target_alive"] = False
+                result["success"]["success_condition"] = "target_state.alive=false"
+                return
+            actor_died_event, cursor = _read_actor_died_event(client, session_id, cursor)
+            if actor_died_event is not None:
+                result["success"]["actor_died_event_detected"] = True
+                result["success"]["success_condition"] = "actor_died_event"
+                return
+            if attack_interval_seconds > 0:
+                time.sleep(attack_interval_seconds)
+        _fail_workflow(
+            "target_survived",
+            f"{name} failed: target is still alive after {attack_max_attempts} attack attempts.",
+            details={"attack_max_attempts": attack_max_attempts},
+        )
+
+    _refresh_context()
+    for index, step_definition in enumerate(steps):
+        _check_timeout()
+        if not isinstance(step_definition, Mapping):
+            _fail_workflow("invalid_step", f"Step at index {index} is not an object.")
+        step_name = str(step_definition.get("name", f"step_{index + 1}")).strip() or f"step_{index + 1}"
+        action = str(step_definition.get("action", "")).strip()
+
+        _refresh_context()
+        when = step_definition.get("when")
+        if isinstance(when, Mapping):
+            passed, details = _evaluate_condition(when, context)
+            command_log.append(
+                {
+                    "name": step_name,
+                    "command": action,
+                    "accepted": passed,
+                    "skipped": not passed,
+                    "condition": details,
+                }
+            )
+            if not passed:
+                continue
+
+        if action == "command":
+            command_name = str(step_definition.get("command", "")).strip()
+            if not command_name:
+                _fail_workflow("invalid_step", f"{step_name} requires a non-empty command.")
+            raw_args = step_definition.get("args", {})
+            command_args = dict(raw_args) if isinstance(raw_args, Mapping) else {}
+            _send_logged_command(step_name, command_name, command_args)
+            if command_name == "move_stick":
+                result["checks"]["approach"] = True
+            if command_name == "attack":
+                result["checks"]["attack"] = True
+        elif action == "wait":
+            seconds = max(0.0, _safe_float(step_definition.get("seconds"), 0.0))
+            time.sleep(seconds)
+            command_log.append(
+                {
+                    "name": step_name,
+                    "command": "wait",
+                    "accepted": True,
+                    "duration_seconds": round(seconds, 3),
+                }
+            )
+        elif action == "move_phase":
+            raw_args = step_definition.get("args", {})
+            args_map = dict(raw_args) if isinstance(raw_args, Mapping) else {}
+            _run_move_phase(step_name, args_map)
+        elif action == "move_to_location":
+            raw_args = step_definition.get("args", {})
+            args_map = dict(raw_args) if isinstance(raw_args, Mapping) else {}
+            _run_move_to_location(step_name, args_map)
+        elif action == "defeat_target":
+            raw_args = step_definition.get("args", {})
+            args_map = dict(raw_args) if isinstance(raw_args, Mapping) else {}
+            _run_defeat_target(step_name, args_map)
+        else:
+            _fail_workflow("unsupported_action", f"{step_name} uses unsupported action '{action}'.")
+
+        _refresh_context()
+
+    if isinstance(assertions, Sequence):
+        for assertion_index, assertion in enumerate(assertions):
+            if not isinstance(assertion, Mapping):
+                _fail_workflow("invalid_assertion", f"Assertion at index {assertion_index} is not an object.")
+            passed, details = _evaluate_condition(assertion, context)
+            assertion_name = str(assertion.get("name", f"assertion_{assertion_index + 1}")).strip() or f"assertion_{assertion_index + 1}"
+            assertion_record = {
+                "name": assertion_name,
+                "passed": passed,
+                "details": details,
+                "message": assertion.get("message"),
+            }
+            if isinstance(observation.get("assertions"), list):
+                observation["assertions"].append(assertion_record)
+            if not passed:
+                _fail_workflow(
+                    "assertion_failed",
+                    str(assertion.get("message", f"{assertion_name} failed.")),
+                    details=details,
+                )
+
+    result["success"]["success_condition"] = completion_state
     result["checks"]["scenario_flow"] = True
     _finalize_step_record(
         step,
@@ -693,7 +1140,14 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
         }
         result["checks"]["capabilities"] = True
 
-        session_start = client.start_session(session_id=session_id, run_id=run_id)
+        session_start = client.start_session(
+            session_id=session_id,
+            run_id=run_id,
+            options={
+                "auto_play_editor": bool(args.auto_play_editor),
+                "auto_play_wait_seconds": max(0.0, args.auto_play_wait_seconds),
+            },
+        )
         if not bool(session_start.get("accepted", False)):
             raise E2ERunnerError("session_start was not accepted.")
         started_session = True
@@ -701,8 +1155,39 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
         result["session_id"] = session_id
         result["session_start"] = session_start
         result["checks"]["session_start"] = True
+        auto_play_status_available = ("auto_play_editor_requested" in session_start) or (
+            "auto_play_editor_ready" in session_start
+        )
+        if "auto_play_editor_requested" in session_start:
+            result["notes"].append(f"auto_play_editor_requested:{session_start.get('auto_play_editor_requested')}")
+        if "auto_play_editor_ready" in session_start:
+            result["notes"].append(f"auto_play_editor_ready:{session_start.get('auto_play_editor_ready')}")
+        if session_start.get("auto_play_editor_error"):
+            result["notes"].append(f"auto_play_editor_error:{session_start.get('auto_play_editor_error')}")
+        if args.auto_play_editor and not auto_play_status_available:
+            result["notes"].append("auto_play_editor_status_unavailable:server_may_be_stale")
+            if args.require_auto_play_editor:
+                raise E2ERunnerError(
+                    "session_start response does not include auto_play_editor status fields. "
+                    "Rebuild UnrealAgentTest module and retry."
+                )
 
         cursor = _safe_sequence(client.get_events(session_id=session_id, limit=1).get("last_sequence"), 0)
+
+        if scenario_intent == SUPPORTED_WORKFLOW_INTENT:
+            _run_workflow_steps(
+                client,
+                result,
+                session_id=session_id,
+                scenario_definition=scenario_definition,
+                poll_interval=args.poll_interval,
+            )
+            stop_response = client.stop_session(session_id=session_id)
+            result["session_stop"] = stop_response
+            result["checks"]["session_stop"] = bool(stop_response.get("accepted", False))
+            started_session = False
+            result["ok"] = True
+            return result
 
         if scenario_intent == SUPPORTED_MOVEMENT_INTENT:
             _run_movement_jump_sequence(
@@ -1035,6 +1520,8 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
         if launch_ctx is not None:
             if args.keep_process:
                 result["notes"].append("launched_process_kept_alive:override")
+            elif (not bool(result.get("ok", False))) and args.keep_process_on_failure:
+                result["notes"].append("launched_process_kept_alive:run_failed")
             elif termination_mode == "keep_running":
                 result["notes"].append("launched_process_kept_alive")
             else:
@@ -1067,6 +1554,33 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--retry-backoff", type=float, default=0.25, help="HTTP retry backoff seconds.")
     parser.add_argument("--health-timeout", type=float, default=90.0, help="Health wait timeout seconds.")
     parser.add_argument("--poll-interval", type=float, default=0.25, help="Polling interval seconds.")
+    parser.add_argument(
+        "--auto-play-editor",
+        dest="auto_play_editor",
+        action="store_true",
+        default=True,
+        help="Request editor PIE auto-start on session_start when needed.",
+    )
+    parser.add_argument(
+        "--no-auto-play-editor",
+        dest="auto_play_editor",
+        action="store_false",
+        help="Disable editor PIE auto-start request on session_start.",
+    )
+    parser.add_argument(
+        "--auto-play-wait-seconds",
+        type=float,
+        default=15.0,
+        help="Maximum wait for editor PIE auto-start readiness on session_start.",
+    )
+    parser.add_argument(
+        "--require-auto-play-editor",
+        action="store_true",
+        help=(
+            "Fail fast when session_start does not expose auto_play_editor status fields. "
+            "Use this to enforce rebuilt server binaries."
+        ),
+    )
     parser.add_argument(
         "--scenario-json",
         default="",
@@ -1158,6 +1672,19 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Grace seconds before kill fallback when terminating launched Unreal process.",
     )
     parser.add_argument("--keep-process", action="store_true", help="Do not terminate launched Unreal process.")
+    parser.add_argument(
+        "--keep-process-on-failure",
+        dest="keep_process_on_failure",
+        action="store_true",
+        default=True,
+        help="Keep launched Unreal process alive when run fails (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-keep-process-on-failure",
+        dest="keep_process_on_failure",
+        action="store_false",
+        help="Terminate launched Unreal process on failure according to termination_mode.",
+    )
     return parser.parse_args(argv)
 
 

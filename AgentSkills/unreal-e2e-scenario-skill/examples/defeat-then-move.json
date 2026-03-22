@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "source_text": "몬스터를 쓰러트렸으면 X=300,Y=100 위치로 이동",
+  "language": "ko",
+  "intent": "workflow_steps",
+  "steps": [
+    {
+      "name": "defeat_target",
+      "action": "defeat_target",
+      "args": {
+        "attack_max_attempts": 20,
+        "attack_interval_seconds": 0.1,
+        "post_attack_settle_seconds": 0.05
+      }
+    },
+    {
+      "name": "move_after_target_down",
+      "action": "move_to_location",
+      "when": {
+        "state": "target_state",
+        "path": "alive",
+        "op": "eq",
+        "value": false
+      },
+      "args": {
+        "x": 300.0,
+        "y": 100.0,
+        "tolerance_cm": 30.0,
+        "max_seconds": 15.0
+      }
+    }
+  ],
+  "assertions": [
+    {
+      "name": "target_must_be_dead",
+      "state": "target_state",
+      "path": "alive",
+      "op": "eq",
+      "value": false,
+      "message": "타겟이 처치되지 않았습니다."
+    }
+  ],
+  "success_criteria": {
+    "timeout_seconds": 120,
+    "completion_state": "steps_completed"
+  },
+  "failure_criteria": {
+    "input_failure_limit": 3
+  },
+  "termination": {
+    "mode": "keep_running"
+  }
+}

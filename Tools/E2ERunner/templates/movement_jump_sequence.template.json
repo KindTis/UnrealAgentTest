@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "source_text": "요청 문장을 그대로 넣으세요.",
+  "language": "ko",
+  "intent": "movement_jump_sequence",
+  "sequence": {
+    "camera_lock_stick_id": "right_stick",
+    "move_stick_id": "left_stick",
+    "jump_button_id": "jump",
+    "jump_duration_ms": 220,
+    "jump_settle_seconds": 0.8,
+    "pulse_interval_seconds": 0.1,
+    "phases": [
+      {
+        "name": "forward",
+        "move_x": 0.0,
+        "move_y": 1.0,
+        "duration_seconds": 2.0,
+        "jump_after": true
+      },
+      {
+        "name": "left",
+        "move_x": -1.0,
+        "move_y": 0.0,
+        "duration_seconds": 2.0,
+        "jump_after": true
+      },
+      {
+        "name": "backward",
+        "move_x": 0.0,
+        "move_y": -1.0,
+        "duration_seconds": 2.0,
+        "jump_after": true
+      }
+    ]
+  },
+  "success_criteria": {
+    "timeout_seconds": 30,
+    "completion_state": "sequence_completed"
+  },
+  "failure_criteria": {
+    "input_failure_limit": 3
+  },
+  "termination": {
+    "mode": "keep_running"
+  }
+}

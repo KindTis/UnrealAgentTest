@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "source_text": "요청 문장을 그대로 넣으세요.",
+  "language": "ko",
+  "intent": "defeat_monster",
+  "weapon": "A",
+  "target_selector": {
+    "type": "forward_cone",
+    "relative_to": "player_forward",
+    "yaw_degrees": 45,
+    "target_kind": "monster"
+  },
+  "success_criteria": {
+    "timeout_seconds": 60,
+    "target_state": "defeated"
+  },
+  "failure_criteria": {
+    "target_lost_timeout_seconds": 10,
+    "input_failure_limit": 3
+  },
+  "termination": {
+    "mode": "keep_running"
+  }
+}

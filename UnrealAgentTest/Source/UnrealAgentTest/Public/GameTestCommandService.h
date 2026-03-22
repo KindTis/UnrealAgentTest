@@ -43,6 +43,7 @@ private:
 	static bool ValidateTapButton(const FGameTestCommandRequest& Request, FGameTestCommandResponse& OutResponse);
 	static bool ValidateMoveStick(const FGameTestCommandRequest& Request, FGameTestCommandResponse& OutResponse);
 	static bool ValidateReleaseStick(const FGameTestCommandRequest& Request, FGameTestCommandResponse& OutResponse);
+	static bool ValidateCameraYaw(const FGameTestCommandRequest& Request, FGameTestCommandResponse& OutResponse);
 	static bool ValidateExecuteRecipe(const FGameTestCommandRequest& Request, FGameTestCommandResponse& OutResponse);
 
 	static FString BuildTraceId();

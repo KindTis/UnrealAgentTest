@@ -121,6 +121,7 @@
         "equip",
         "approach",
         "attack",
+        "vision_navigation",
         "session_stop"
       ],
       "properties": {
@@ -140,6 +141,9 @@
           "type": "boolean"
         },
         "attack": {
+          "type": "boolean"
+        },
+        "vision_navigation": {
           "type": "boolean"
         },
         "session_stop": {
@@ -306,6 +310,77 @@
             "null"
           ],
           "minLength": 1
+        }
+      }
+    },
+    "vision_navigation": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "intent": {
+          "type": "string",
+          "enum": [
+            "vision_navigation"
+          ]
+        },
+        "success_mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "position",
+            "visual",
+            "hybrid",
+            null
+          ]
+        },
+        "goal": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "loop": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "capture": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "decision_bridge": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "iterations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "final_observation": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "final_decision": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "success_evaluation": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
         }
       }
     },

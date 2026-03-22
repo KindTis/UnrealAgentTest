@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -26,6 +27,7 @@ from Tools.ParallelRunner.parallel_runner import (  # noqa: E402
 from Tools.E2ERunner.scenario_schema import (  # noqa: E402
     SUPPORTED_DEFEAT_INTENT,
     SUPPORTED_MOVEMENT_INTENT,
+    SUPPORTED_VISION_NAVIGATION_INTENT,
     SUPPORTED_WORKFLOW_INTENT,
     TERMINATION_MODES,
     validate_scenario,
@@ -34,6 +36,16 @@ from Tools.UnrealTestClient.unreal_test_client import (  # noqa: E402
     UnrealTestClient,
     UnrealTestClientError,
 )
+
+
+VISION_NAVIGATION_ALLOWED_ACTIONS = ("move_stick", "release_stick", "tap_button", "wait", "camera_yaw")
+VISION_NAVIGATION_ALLOWED_STATUSES = ("continue", "success", "failure")
+VISION_NAVIGATION_ALLOWED_SUCCESS_MODES = ("position", "visual", "hybrid")
+VISION_NAVIGATION_DEFAULT_CAPTURE_HEIGHT = 360
+VISION_NAVIGATION_DEFAULT_CAPTURE_JPEG_QUALITY = 60
+VISION_NAVIGATION_DEFAULT_CAPTURE_PRESERVE_ASPECT_RATIO = True
+VISION_NAVIGATION_DEFAULT_DECIDE_WAIT_TIMEOUT_SECONDS = 30.0
+VISION_NAVIGATION_DEFAULT_DECIDE_RETRY_COUNT = 1
 
 
 class E2ERunnerError(RuntimeError):
@@ -135,7 +147,9 @@ def _wait_until_healthy(client: UnrealTestClient, timeout: float, poll_interval:
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp_path.replace(path)
 
 
 def _start_unreal_if_requested(
@@ -324,6 +338,12 @@ def _to_number(value: Any) -> Optional[float]:
     return None
 
 
+def _is_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (int, float))
+
+
 def _evaluate_condition(condition: Mapping[str, Any], context: Mapping[str, Any]) -> tuple[bool, Dict[str, Any]]:
     state_name = str(condition.get("state", "")).strip()
     path = str(condition.get("path", "")).strip()
@@ -417,6 +437,916 @@ def _send_command(
     if isinstance(response, Mapping):
         return response
     raise E2ERunnerError(f"{command} command response is not a JSON object.")
+
+
+def _build_vision_navigation_bridge_paths(run_dir: Path, session_id: str) -> Dict[str, Path]:
+    bridge_dir = run_dir / "bridge" / session_id
+    return {
+        "bridge_dir": bridge_dir,
+        "observe_path": bridge_dir / "observe.json",
+        "decide_path": bridge_dir / "decide.json",
+        "lock_path": bridge_dir / "bridge.lock",
+    }
+
+
+def _write_vision_navigation_bridge_lock(
+    lock_path: Path,
+    *,
+    run_id: str,
+    session_id: str,
+    iteration: int,
+    status: str,
+    details: Optional[Mapping[str, Any]] = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "session_id": session_id,
+        "iteration": iteration,
+        "status": status,
+        "updated_at_utc": utc_now_iso(),
+    }
+    if details:
+        payload["details"] = dict(details)
+    _write_json(lock_path, payload)
+
+
+def _extract_vision_navigation_position_target(goal: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    position_target = goal.get("position_target")
+    if position_target is None:
+        return None
+
+    if isinstance(position_target, Mapping):
+        x_value = _to_number(position_target.get("x"))
+        y_value = _to_number(position_target.get("y"))
+        tolerance_cm = _safe_float(position_target.get("tolerance_cm"), 50.0)
+        if x_value is None or y_value is None:
+            return None
+        return {
+            "x": x_value,
+            "y": y_value,
+            "tolerance_cm": max(0.1, tolerance_cm),
+        }
+
+    if isinstance(position_target, Sequence) and not isinstance(position_target, (str, bytes)):
+        if len(position_target) < 2:
+            return None
+        x_value = _to_number(position_target[0])
+        y_value = _to_number(position_target[1])
+        tolerance_cm = 50.0
+        if len(position_target) >= 3:
+            tolerance_candidate = _to_number(position_target[2])
+            if tolerance_candidate is not None:
+                tolerance_cm = tolerance_candidate
+        if x_value is None or y_value is None:
+            return None
+        return {
+            "x": x_value,
+            "y": y_value,
+            "tolerance_cm": max(0.1, tolerance_cm),
+        }
+
+    return None
+
+
+def _request_vision_navigation_capture(
+    client: UnrealTestClient,
+    *,
+    session_id: str,
+    capture_timeout_seconds: float,
+    capture_config: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    request_args = {
+        "session_id": session_id,
+        "height": _safe_int(capture_config.get("height"), VISION_NAVIGATION_DEFAULT_CAPTURE_HEIGHT),
+        "preserve_aspect_ratio": bool(
+            capture_config.get(
+                "preserve_aspect_ratio",
+                VISION_NAVIGATION_DEFAULT_CAPTURE_PRESERVE_ASPECT_RATIO,
+            )
+        ),
+        "jpeg_quality": _safe_int(capture_config.get("jpeg_quality"), VISION_NAVIGATION_DEFAULT_CAPTURE_JPEG_QUALITY),
+    }
+
+    screenshot_callable = getattr(client, "get_screenshot", None)
+    if callable(screenshot_callable):
+        try:
+            response = screenshot_callable(**request_args)
+        except TypeError:
+            request_args_no_session = dict(request_args)
+            request_args_no_session.pop("session_id", None)
+            response = screenshot_callable(**request_args_no_session)
+        if isinstance(response, Mapping):
+            return response
+        raise E2ERunnerError("get_screenshot response is not a JSON object.")
+
+    capture_client = UnrealTestClient(
+        client.base_url,
+        timeout=max(0.5, capture_timeout_seconds),
+        retry_attempts=0,
+        retry_backoff=0.0,
+        session_id=session_id,
+    )
+    query = {
+        "session_id": session_id,
+        "height": str(request_args["height"]),
+        "preserve_aspect_ratio": "true" if request_args["preserve_aspect_ratio"] else "false",
+        "jpeg_quality": str(request_args["jpeg_quality"]),
+    }
+    response = capture_client._request("GET", "/capture/screenshot", query=query)
+    if isinstance(response, Mapping):
+        return response
+    raise E2ERunnerError("capture screenshot response is not a JSON object.")
+
+
+def _summarize_vision_navigation_capture_response(response: Mapping[str, Any]) -> Dict[str, Any]:
+    viewport_state = response.get("viewport_state")
+    if not isinstance(viewport_state, Mapping):
+        viewport_state = {}
+
+    image_field_name = None
+    image_value = None
+    for candidate in ("image_base64", "jpeg_base64", "base64_jpeg", "image", "jpeg"):
+        candidate_value = response.get(candidate)
+        if isinstance(candidate_value, str) and candidate_value:
+            image_field_name = candidate
+            image_value = candidate_value
+            break
+
+    summary: Dict[str, Any] = {
+        "captured_session_id": response.get("captured_session_id"),
+        "image_field": image_field_name,
+        "image_base64": image_value,
+        "viewport_state": dict(viewport_state),
+        "image_meta": {
+            "width": response.get("width"),
+            "height": response.get("height"),
+            "content_type": response.get("content_type") or response.get("mime_type"),
+            "jpeg_quality": response.get("jpeg_quality"),
+            "preserve_aspect_ratio": response.get("preserve_aspect_ratio"),
+        },
+        "response_keys": sorted(str(key) for key in response.keys()),
+    }
+    if image_value is not None:
+        summary["image_meta"]["image_characters"] = len(image_value)
+    for key in ("capture_source", "is_minimized", "is_occluded", "is_focused", "viewport_width", "viewport_height"):
+        if key in viewport_state:
+            summary["image_meta"][key] = viewport_state.get(key)
+    error_code = response.get("error_code")
+    if error_code is None:
+        error_code = response.get("error")
+    if isinstance(error_code, str) and error_code.strip():
+        summary["error_code"] = error_code
+
+    error_message = response.get("error_message")
+    if error_message is None:
+        error_message = response.get("message")
+    if isinstance(error_message, str) and error_message.strip():
+        summary["error_message"] = error_message
+    return summary
+
+
+def _classify_vision_navigation_capture_failure(response: Mapping[str, Any]) -> Optional[str]:
+    error_code = response.get("error_code")
+    if error_code is None:
+        error_code = response.get("error")
+    error_code = str(error_code or "").strip().lower()
+    if error_code in {"viewport_minimized", "viewport_occluded", "capture_timeout", "capture_unavailable"}:
+        return error_code
+
+    image_fields = ("image_base64", "jpeg_base64", "base64_jpeg", "image", "jpeg")
+    has_image_payload = any(
+        isinstance(response.get(field), str) and str(response.get(field)).strip()
+        for field in image_fields
+    )
+
+    viewport_state = response.get("viewport_state")
+    if isinstance(viewport_state, Mapping):
+        capture_source = str(viewport_state.get("capture_source", "")).strip().lower()
+        viewport_source = capture_source in {"game_viewport", "pie_viewport"}
+        if bool(viewport_state.get("is_minimized", False)) and (viewport_source or not has_image_payload):
+            return "viewport_minimized"
+        if bool(viewport_state.get("is_occluded", False)) and (viewport_source or not has_image_payload):
+            return "viewport_occluded"
+
+    if not has_image_payload:
+        return "capture_unavailable"
+    return None
+
+
+def _is_valid_vector_payload(payload: Any) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    x_value = payload.get("x")
+    y_value = payload.get("y")
+    z_value = payload.get("z")
+    if not _is_number(x_value) or not _is_number(y_value):
+        return False
+    if z_value is not None and not _is_number(z_value):
+        return False
+    return True
+
+
+def _wait_for_session_ready(
+    client: UnrealTestClient,
+    *,
+    session_id: str,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    require_capture_ready: bool,
+    capture_timeout_seconds: float,
+    stable_capture_count: int,
+    capture_config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    started_at_monotonic = time.monotonic()
+    deadline = started_at_monotonic + max(0.1, timeout_seconds)
+    poll_interval = max(0.05, poll_interval_seconds)
+    stable_capture_target = max(1, stable_capture_count)
+
+    summary: Dict[str, Any] = {
+        "ready": False,
+        "started_at_utc": utc_now_iso(),
+        "ready_at_utc": None,
+        "timeout_seconds": timeout_seconds,
+        "poll_interval_seconds": poll_interval,
+        "require_capture_ready": bool(require_capture_ready),
+        "capture_timeout_seconds": capture_timeout_seconds,
+        "stable_capture_count": stable_capture_target,
+        "attempts": 0,
+        "stable_capture_hits": 0,
+        "last_player_ready": False,
+        "last_spatial_ready": False,
+        "last_capture_ready": (not require_capture_ready),
+        "last_capture_failure_code": None,
+        "last_capture_error": None,
+        "last_viewport_state": {},
+        "elapsed_seconds": None,
+    }
+
+    capture_client = UnrealTestClient(
+        client.base_url,
+        timeout=max(0.5, capture_timeout_seconds),
+        retry_attempts=0,
+        retry_backoff=0.0,
+        session_id=session_id,
+    )
+    capture_request_config = dict(capture_config) if isinstance(capture_config, Mapping) else {}
+
+    while time.monotonic() < deadline:
+        summary["attempts"] = int(summary["attempts"]) + 1
+
+        player_ready = False
+        spatial_ready = False
+        capture_ready = not require_capture_ready
+        capture_failure_code: Optional[str] = None
+        capture_error: Optional[str] = None
+        viewport_state: Dict[str, Any] = {}
+
+        try:
+            player_state = client.get_player_state(session_id=session_id)
+            if isinstance(player_state, Mapping):
+                actor_id = str(player_state.get("actor_id") or "").strip()
+                player_location = player_state.get("location")
+                player_ready = bool(actor_id) and _is_valid_vector_payload(player_location)
+        except Exception as exc:  # noqa: BLE001
+            player_ready = False
+            capture_error = f"player_state:{type(exc).__name__}:{exc}"
+
+        try:
+            spatial_state = client.get_spatial_state(session_id=session_id)
+            if isinstance(spatial_state, Mapping):
+                spatial_actor_id = str(spatial_state.get("player_actor_id") or "").strip()
+                spatial_location = spatial_state.get("player_location")
+                spatial_ready = bool(spatial_actor_id) and _is_valid_vector_payload(spatial_location)
+        except Exception as exc:  # noqa: BLE001
+            spatial_ready = False
+            if capture_error is None:
+                capture_error = f"spatial_state:{type(exc).__name__}:{exc}"
+
+        if require_capture_ready:
+            try:
+                capture_response = _request_vision_navigation_capture(
+                    capture_client,
+                    session_id=session_id,
+                    capture_timeout_seconds=capture_timeout_seconds,
+                    capture_config=capture_request_config,
+                )
+                if isinstance(capture_response, Mapping):
+                    raw_viewport_state = capture_response.get("viewport_state")
+                    if isinstance(raw_viewport_state, Mapping):
+                        viewport_state = dict(raw_viewport_state)
+                    capture_failure_code = _classify_vision_navigation_capture_failure(capture_response)
+                    if capture_failure_code is None:
+                        summary["stable_capture_hits"] = int(summary["stable_capture_hits"]) + 1
+                        capture_ready = int(summary["stable_capture_hits"]) >= stable_capture_target
+                    else:
+                        summary["stable_capture_hits"] = 0
+                        capture_ready = False
+                else:
+                    capture_failure_code = "capture_unavailable"
+                    summary["stable_capture_hits"] = 0
+                    capture_ready = False
+            except Exception as exc:  # noqa: BLE001
+                lowered = str(exc).lower()
+                if "timeout" in lowered or "timed out" in lowered:
+                    capture_failure_code = "capture_timeout"
+                else:
+                    capture_failure_code = "capture_unavailable"
+                capture_error = f"capture:{type(exc).__name__}:{exc}"
+                summary["stable_capture_hits"] = 0
+                capture_ready = False
+
+        summary["last_player_ready"] = player_ready
+        summary["last_spatial_ready"] = spatial_ready
+        summary["last_capture_ready"] = capture_ready
+        summary["last_capture_failure_code"] = capture_failure_code
+        summary["last_capture_error"] = capture_error
+        summary["last_viewport_state"] = dict(viewport_state)
+
+        if player_ready and spatial_ready and capture_ready:
+            summary["ready"] = True
+            summary["ready_at_utc"] = utc_now_iso()
+            summary["elapsed_seconds"] = round(max(0.0, time.monotonic() - started_at_monotonic), 3)
+            return summary
+
+        time.sleep(poll_interval)
+
+    summary["ready"] = False
+    summary["elapsed_seconds"] = round(max(0.0, time.monotonic() - started_at_monotonic), 3)
+    return summary
+
+
+def _validate_vision_navigation_decision(
+    decision: Mapping[str, Any],
+    *,
+    run_id: str,
+    session_id: str,
+    iteration: int,
+) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(decision, Mapping):
+        return ["decide.json must be a JSON object"]
+
+    if decision.get("schema_version", 1) != 1:
+        errors.append("decide.json.schema_version must be 1")
+    if decision.get("run_id") != run_id:
+        errors.append("decide.json.run_id must match the current run_id")
+    if decision.get("session_id") != session_id:
+        errors.append("decide.json.session_id must match the current session_id")
+    if decision.get("iteration") != iteration:
+        errors.append("decide.json.iteration must match the current iteration")
+
+    status = decision.get("status")
+    if status not in VISION_NAVIGATION_ALLOWED_STATUSES:
+        errors.append(
+            f"decide.json.status must be one of {', '.join(VISION_NAVIGATION_ALLOWED_STATUSES)}"
+        )
+
+    if "success" in decision and not isinstance(decision.get("success"), bool):
+        errors.append("decide.json.success must be a boolean when provided")
+
+    if "success_mode" in decision and decision.get("success_mode") not in VISION_NAVIGATION_ALLOWED_SUCCESS_MODES:
+        errors.append(
+            f"decide.json.success_mode must be one of {', '.join(VISION_NAVIGATION_ALLOWED_SUCCESS_MODES)}"
+        )
+
+    if "reason" in decision and (not isinstance(decision.get("reason"), str) or not str(decision.get("reason")).strip()):
+        errors.append("decide.json.reason must be a non-empty string when provided")
+
+    actions = decision.get("actions")
+    if not isinstance(actions, Sequence) or isinstance(actions, (str, bytes)):
+        errors.append("decide.json.actions must be an array")
+        return errors
+
+    for index, action in enumerate(actions):
+        scope = f"decide.json.actions[{index}]"
+        if not isinstance(action, Mapping):
+            errors.append(f"{scope} must be an object")
+            continue
+
+        action_name = str(action.get("action", "")).strip()
+        if action_name not in VISION_NAVIGATION_ALLOWED_ACTIONS:
+            errors.append(f"{scope}.action must be one of {', '.join(VISION_NAVIGATION_ALLOWED_ACTIONS)}")
+            continue
+
+        args = action.get("args", {})
+        if args is not None and not isinstance(args, Mapping):
+            errors.append(f"{scope}.args must be an object when provided")
+            continue
+
+        args_map = dict(args) if isinstance(args, Mapping) else {}
+        if action_name == "move_stick":
+            for key in ("stick_id", "x", "y"):
+                if key not in args_map:
+                    errors.append(f"{scope}.args.{key} is required")
+            if "stick_id" in args_map and (not isinstance(args_map.get("stick_id"), str) or not str(args_map.get("stick_id")).strip()):
+                errors.append(f"{scope}.args.stick_id must be a non-empty string")
+            for key in ("x", "y"):
+                if key in args_map and not _is_number(args_map.get(key)):
+                    errors.append(f"{scope}.args.{key} must be a number")
+            if "duration_ms" in args_map and (not isinstance(args_map.get("duration_ms"), int) or isinstance(args_map.get("duration_ms"), bool)):
+                errors.append(f"{scope}.args.duration_ms must be an integer when provided")
+        elif action_name == "release_stick":
+            if "stick_id" not in args_map:
+                errors.append(f"{scope}.args.stick_id is required")
+            elif not isinstance(args_map.get("stick_id"), str) or not str(args_map.get("stick_id")).strip():
+                errors.append(f"{scope}.args.stick_id must be a non-empty string")
+        elif action_name == "tap_button":
+            if "button_id" not in args_map:
+                errors.append(f"{scope}.args.button_id is required")
+            elif not isinstance(args_map.get("button_id"), str) or not str(args_map.get("button_id")).strip():
+                errors.append(f"{scope}.args.button_id must be a non-empty string")
+            if "duration_ms" in args_map and (not isinstance(args_map.get("duration_ms"), int) or isinstance(args_map.get("duration_ms"), bool)):
+                errors.append(f"{scope}.args.duration_ms must be an integer when provided")
+        elif action_name == "wait":
+            if "seconds" not in args_map:
+                errors.append(f"{scope}.args.seconds is required")
+            elif not _is_number(args_map.get("seconds")):
+                errors.append(f"{scope}.args.seconds must be a number")
+            elif float(args_map.get("seconds")) < 0.0:
+                errors.append(f"{scope}.args.seconds must be >= 0")
+        elif action_name == "camera_yaw":
+            if "degrees" not in args_map and "delta_degrees" not in args_map:
+                errors.append(f"{scope}.args.degrees or {scope}.args.delta_degrees is required")
+            if "degrees" in args_map and not _is_number(args_map.get("degrees")):
+                errors.append(f"{scope}.args.degrees must be a number")
+            if "delta_degrees" in args_map and not _is_number(args_map.get("delta_degrees")):
+                errors.append(f"{scope}.args.delta_degrees must be a number")
+            if "duration_ms" in args_map and (not isinstance(args_map.get("duration_ms"), int) or isinstance(args_map.get("duration_ms"), bool)):
+                errors.append(f"{scope}.args.duration_ms must be an integer when provided")
+
+    return errors
+
+
+def _normalize_vision_navigation_action(action: Mapping[str, Any]) -> Dict[str, Any]:
+    action_name = str(action.get("action", "")).strip()
+    args = action.get("args", {})
+    args_map = dict(args) if isinstance(args, Mapping) else {}
+
+    if action_name == "move_stick":
+        normalized = {
+            "stick_id": str(args_map.get("stick_id", "")).strip(),
+            "x": _safe_float(args_map.get("x"), 0.0),
+            "y": _safe_float(args_map.get("y"), 0.0),
+        }
+        if "duration_ms" in args_map:
+            normalized["duration_ms"] = _safe_int(args_map.get("duration_ms"), 120)
+        return normalized
+
+    if action_name == "release_stick":
+        return {"stick_id": str(args_map.get("stick_id", "")).strip()}
+
+    if action_name == "tap_button":
+        normalized = {
+            "button_id": str(args_map.get("button_id", "")).strip(),
+        }
+        if "duration_ms" in args_map:
+            normalized["duration_ms"] = _safe_int(args_map.get("duration_ms"), 120)
+        return normalized
+
+    if action_name == "wait":
+        return {"seconds": max(0.0, _safe_float(args_map.get("seconds"), 0.0))}
+
+    if action_name == "camera_yaw":
+        degrees_value = args_map.get("degrees")
+        if degrees_value is None:
+            degrees_value = args_map.get("delta_degrees")
+        normalized = {"degrees": _safe_float(degrees_value, 0.0)}
+        if "duration_ms" in args_map:
+            normalized["duration_ms"] = _safe_int(args_map.get("duration_ms"), 120)
+        return normalized
+
+    raise E2ERunnerError(f"Unsupported vision_navigation action: {action_name}")
+
+
+def _evaluate_vision_navigation_success(
+    *,
+    success_mode: str,
+    decision: Mapping[str, Any],
+    player_state: Mapping[str, Any],
+    goal_position_target: Optional[Mapping[str, Any]],
+    viewport_state: Mapping[str, Any],
+) -> tuple[bool, Dict[str, Any], str]:
+    safety_ok = not bool(viewport_state.get("is_minimized", False)) and not bool(viewport_state.get("is_occluded", False))
+    decision_success = bool(decision.get("success", False)) or str(decision.get("status", "")).strip().lower() == "success"
+
+    result: Dict[str, Any] = {
+        "success_mode": success_mode,
+        "safety_ok": safety_ok,
+        "decision_success": decision_success,
+        "player_location": None,
+        "goal_position_target": dict(goal_position_target) if isinstance(goal_position_target, Mapping) else None,
+        "position_distance_cm": None,
+        "position_reached": False,
+        "visual_ready": False,
+    }
+
+    location = player_state.get("location")
+    if isinstance(location, Mapping):
+        result["player_location"] = {
+            "x": _safe_float(location.get("x"), 0.0),
+            "y": _safe_float(location.get("y"), 0.0),
+            "z": _safe_float(location.get("z"), 0.0),
+        }
+
+    if isinstance(goal_position_target, Mapping):
+        target_x = _safe_float(goal_position_target.get("x"), 0.0)
+        target_y = _safe_float(goal_position_target.get("y"), 0.0)
+        tolerance_cm = max(0.1, _safe_float(goal_position_target.get("tolerance_cm"), 50.0))
+        if isinstance(location, Mapping):
+            current_x = _safe_float(location.get("x"), 0.0)
+            current_y = _safe_float(location.get("y"), 0.0)
+            distance_cm = math.hypot(target_x - current_x, target_y - current_y)
+            result["position_distance_cm"] = round(distance_cm, 3)
+            result["position_reached"] = distance_cm <= tolerance_cm
+        if result["position_reached"]:
+            return True, result, "position_goal_reached"
+
+    if success_mode == "position":
+        return False, result, "position_pending"
+
+    result["visual_ready"] = decision_success and safety_ok
+    if success_mode == "visual":
+        if result["visual_ready"]:
+            return True, result, "visual_goal_reached"
+        return False, result, "visual_pending"
+
+    if success_mode == "hybrid":
+        if result["visual_ready"]:
+            return True, result, "hybrid_goal_reached"
+        return False, result, "hybrid_pending"
+
+    return False, result, "unknown_success_mode"
+
+
+def _run_vision_navigation(
+    client: UnrealTestClient,
+    result: Dict[str, Any],
+    *,
+    run_id: str,
+    run_dir: Path,
+    session_id: str,
+    scenario_definition: Mapping[str, Any],
+    poll_interval: float,
+    request_timeout: float,
+) -> None:
+    goal = scenario_definition.get("goal", {})
+    success_criteria = scenario_definition.get("success_criteria", {})
+    failure_criteria = scenario_definition.get("failure_criteria", {})
+    loop_config = scenario_definition.get("loop", {})
+    capture_config = scenario_definition.get("capture", {})
+    decision_bridge = scenario_definition.get("decision_bridge", {})
+    if not all(isinstance(item, Mapping) for item in (goal, success_criteria, failure_criteria, loop_config, capture_config, decision_bridge)):
+        raise E2ERunnerError("vision_navigation scenario fields must be objects.")
+
+    timeout_seconds = _safe_float(success_criteria.get("timeout_seconds"), 240.0)
+    success_mode = str(success_criteria.get("success_mode", "visual")).strip() or "visual"
+    max_iterations = _safe_int(loop_config.get("max_iterations"), 120)
+    observe_interval_seconds = max(0.05, _safe_float(loop_config.get("observe_interval_seconds"), max(poll_interval, 0.25)))
+    capture_timeout_seconds = max(0.5, _safe_float(loop_config.get("capture_timeout_seconds"), 2.0))
+    action_timeout_seconds = max(0.0, _safe_float(loop_config.get("action_timeout_seconds"), 3.0))
+    input_failure_limit = _safe_int(failure_criteria.get("input_failure_limit"), 3)
+    capture_failure_limit = _safe_int(failure_criteria.get("capture_failure_limit"), 1)
+    decide_wait_timeout_seconds = max(1.0, _safe_float(decision_bridge.get("decide_wait_timeout_seconds"), VISION_NAVIGATION_DEFAULT_DECIDE_WAIT_TIMEOUT_SECONDS))
+    decide_retry_count = max(0, _safe_int(decision_bridge.get("decide_retry_count"), VISION_NAVIGATION_DEFAULT_DECIDE_RETRY_COUNT))
+    capture_height = _safe_int(capture_config.get("height"), VISION_NAVIGATION_DEFAULT_CAPTURE_HEIGHT)
+    capture_jpeg_quality = _safe_int(capture_config.get("jpeg_quality"), VISION_NAVIGATION_DEFAULT_CAPTURE_JPEG_QUALITY)
+    capture_preserve_aspect_ratio = bool(capture_config.get("preserve_aspect_ratio", VISION_NAVIGATION_DEFAULT_CAPTURE_PRESERVE_ASPECT_RATIO))
+    goal_position_target = _extract_vision_navigation_position_target(goal)
+
+    bridge_paths = _build_vision_navigation_bridge_paths(run_dir, session_id)
+    bridge_dir = bridge_paths["bridge_dir"]
+    observe_path = bridge_paths["observe_path"]
+    decide_path = bridge_paths["decide_path"]
+    lock_path = bridge_paths["lock_path"]
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    decide_path.unlink(missing_ok=True)
+
+    step = _create_step_record(
+        "vision_navigation",
+        command="observe_decide_act_loop",
+        request_args={
+            "timeout_seconds": timeout_seconds,
+            "success_mode": success_mode,
+            "max_iterations": max_iterations,
+            "observe_interval_seconds": observe_interval_seconds,
+            "capture_timeout_seconds": capture_timeout_seconds,
+            "action_timeout_seconds": action_timeout_seconds,
+            "input_failure_limit": input_failure_limit,
+            "capture_failure_limit": capture_failure_limit,
+            "decide_wait_timeout_seconds": decide_wait_timeout_seconds,
+            "decide_retry_count": decide_retry_count,
+        },
+    )
+    result["steps"].append(step)
+    step_started_at_monotonic = time.monotonic()
+    deadline = step_started_at_monotonic + max(1.0, timeout_seconds)
+    decision_poll_interval = max(0.05, min(observe_interval_seconds, poll_interval if poll_interval > 0 else observe_interval_seconds, 0.5))
+    capture_client = UnrealTestClient(
+        client.base_url,
+        timeout=max(0.5, capture_timeout_seconds),
+        retry_attempts=0,
+        retry_backoff=0.0,
+        session_id=session_id,
+    )
+    iterations: list[Dict[str, Any]] = []
+    result["vision_navigation"] = {
+        "intent": SUPPORTED_VISION_NAVIGATION_INTENT,
+        "goal": {"description": goal.get("description"), "visual_target": goal.get("visual_target"), "position_target": dict(goal_position_target) if goal_position_target is not None else None},
+        "success_mode": success_mode,
+        "loop": {"max_iterations": max_iterations, "observe_interval_seconds": observe_interval_seconds, "capture_timeout_seconds": capture_timeout_seconds, "action_timeout_seconds": action_timeout_seconds},
+        "capture": {"height": capture_height, "preserve_aspect_ratio": capture_preserve_aspect_ratio, "jpeg_quality": capture_jpeg_quality},
+        "decision_bridge": {"mode": "file", "decide_wait_timeout_seconds": decide_wait_timeout_seconds, "decide_retry_count": decide_retry_count, "observe_path": str(observe_path), "decide_path": str(decide_path), "lock_path": str(lock_path)},
+        "iterations": iterations,
+        "final_observation": None,
+        "final_decision": None,
+        "success_evaluation": None,
+    }
+    result["notes"].append(f"vision_navigation_bridge_dir:{bridge_dir}")
+    result["notes"].append(f"vision_navigation_success_mode:{success_mode}")
+    if goal_position_target is not None:
+        result["notes"].append("vision_navigation_position_target:" + json.dumps(goal_position_target, ensure_ascii=False, separators=(",", ":")))
+
+    consecutive_input_failures = 0
+    capture_failure_seen = 0
+
+    def _fail(code: str, message: str, *, details: Optional[Mapping[str, Any]] = None, response: Optional[Mapping[str, Any]] = None, record: Optional[Dict[str, Any]] = None) -> None:
+        failure = _make_failure("vision_navigation", code, message, details=details)
+        if record is not None:
+            record["failure"] = dict(failure)
+            record["ended_at_utc"] = utc_now_iso()
+            if record.get("started_at_monotonic") is not None:
+                record["duration_seconds"] = round(max(0.0, time.monotonic() - float(record["started_at_monotonic"])), 3)
+            record.pop("started_at_monotonic", None)
+        _write_vision_navigation_bridge_lock(lock_path, run_id=run_id, session_id=session_id, iteration=_safe_int(record.get("iteration") if record else 0, 0), status="failed", details={"code": code, "message": message})
+        _finalize_step_record(step, status="failed", response=response, observation=result["vision_navigation"], failure=failure, started_at_monotonic=step_started_at_monotonic)
+        raise E2ERunnerError(message)
+
+    def _retry_capture_failure(
+        code: str,
+        message: str,
+        *,
+        details: Optional[Mapping[str, Any]] = None,
+        response: Optional[Mapping[str, Any]] = None,
+        record: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        nonlocal capture_failure_seen
+        capture_failure_seen += 1
+        if capture_failure_seen >= capture_failure_limit:
+            _fail(code, message, details=details, response=response, record=record)
+
+        failure = _make_failure("vision_navigation", code, message, details=details)
+        if record is not None:
+            record["failure"] = dict(failure)
+            record["status"] = "retryable_failure"
+            record["ended_at_utc"] = utc_now_iso()
+            if record.get("started_at_monotonic") is not None:
+                record["duration_seconds"] = round(max(0.0, time.monotonic() - float(record["started_at_monotonic"])), 3)
+            record.pop("started_at_monotonic", None)
+
+        _write_vision_navigation_bridge_lock(
+            lock_path,
+            run_id=run_id,
+            session_id=session_id,
+            iteration=_safe_int(record.get("iteration") if record else 0, 0),
+            status="retry_pending",
+            details={
+                "reason": code,
+                "capture_failure_seen": capture_failure_seen,
+                "capture_failure_limit": capture_failure_limit,
+            },
+        )
+        time.sleep(observe_interval_seconds)
+
+    def _timeout_check() -> None:
+        if time.monotonic() >= deadline:
+            _fail("overall_timeout", f"Vision navigation exceeded timeout ({timeout_seconds} seconds).", details={"timeout_seconds": timeout_seconds})
+
+    def _wait_for_decision(iteration: int) -> Mapping[str, Any]:
+        validation_failures = 0
+        decision_deadline = time.monotonic() + decide_wait_timeout_seconds
+        while time.monotonic() < decision_deadline:
+            _timeout_check()
+            if not decide_path.exists():
+                time.sleep(decision_poll_interval)
+                continue
+            try:
+                decision_payload = json.loads(decide_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                validation_failures += 1
+                if validation_failures > decide_retry_count:
+                    _fail("decision_validation_failed", "Vision decision validation failed.", details={"iteration": iteration, "error": f"{type(exc).__name__}: {exc}"})
+                time.sleep(decision_poll_interval)
+                continue
+            if not isinstance(decision_payload, Mapping):
+                validation_failures += 1
+                if validation_failures > decide_retry_count:
+                    _fail("decision_validation_failed", "Vision decision validation failed.", details={"iteration": iteration, "error": "decide.json must be a JSON object"})
+                time.sleep(decision_poll_interval)
+                continue
+            validation_errors = _validate_vision_navigation_decision(decision_payload, run_id=run_id, session_id=session_id, iteration=iteration)
+            if validation_errors:
+                validation_failures += 1
+                if validation_failures > decide_retry_count:
+                    _fail("decision_validation_failed", "Vision decision validation failed.", details={"iteration": iteration, "errors": validation_errors})
+                time.sleep(decision_poll_interval)
+                continue
+            return dict(decision_payload)
+        _fail("decision_timeout", f"Timed out waiting for decide.json after {decide_wait_timeout_seconds} seconds.", details={"iteration": iteration, "timeout_seconds": decide_wait_timeout_seconds})
+
+    iteration = 0
+    while True:
+        _timeout_check()
+        if iteration >= max_iterations:
+            _fail("max_iterations_reached", f"Vision navigation reached max_iterations ({max_iterations}) without success.", details={"max_iterations": max_iterations})
+        iteration += 1
+        decide_path.unlink(missing_ok=True)
+        record: Dict[str, Any] = {"iteration": iteration, "started_at_utc": utc_now_iso(), "started_at_monotonic": time.monotonic(), "status": "running", "observation": None, "decision": None, "actions": [], "success_evaluation": None, "failure": None}
+        iterations.append(record)
+        _write_vision_navigation_bridge_lock(lock_path, run_id=run_id, session_id=session_id, iteration=iteration, status="observing")
+
+        try:
+            player_state = client.get_player_state(session_id=session_id)
+            spatial_state = client.get_spatial_state(session_id=session_id)
+        except UnrealTestClientError as exc:
+            _fail("state_query_failed", f"Failed to read vision navigation state: {exc}", details={"iteration": iteration}, record=record)
+
+        try:
+            capture_response = _request_vision_navigation_capture(capture_client, session_id=session_id, capture_timeout_seconds=capture_timeout_seconds, capture_config={"height": capture_height, "preserve_aspect_ratio": capture_preserve_aspect_ratio, "jpeg_quality": capture_jpeg_quality})
+        except UnrealTestClientError as exc:
+            lowered = str(exc).lower()
+            code = "capture_timeout" if ("timeout" in lowered or "timed out" in lowered) else "capture_unavailable"
+            _retry_capture_failure(code, f"Viewport capture failed: {exc}", details={"iteration": iteration, "capture_failure_seen": capture_failure_seen + 1}, record=record)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            _retry_capture_failure("capture_unavailable", f"Viewport capture failed: {exc}", details={"iteration": iteration, "capture_failure_seen": capture_failure_seen + 1}, record=record)
+            continue
+
+        if not isinstance(capture_response, Mapping):
+            _retry_capture_failure("capture_unavailable", "Viewport capture response was not a JSON object.", details={"iteration": iteration, "capture_failure_seen": capture_failure_seen + 1}, record=record)
+            continue
+
+        capture_failure_code = _classify_vision_navigation_capture_failure(capture_response)
+        if capture_failure_code is not None:
+            if capture_failure_code in {"viewport_minimized", "viewport_occluded"}:
+                _fail(
+                    capture_failure_code,
+                    f"Viewport capture failed with {capture_failure_code}.",
+                    details={"iteration": iteration, "capture_failure_seen": capture_failure_seen},
+                    response=capture_response,
+                    record=record,
+                )
+            _retry_capture_failure(
+                capture_failure_code,
+                f"Viewport capture failed with {capture_failure_code}.",
+                details={"iteration": iteration, "capture_failure_seen": capture_failure_seen + 1},
+                response=capture_response,
+                record=record,
+            )
+            continue
+
+        capture_failure_seen = 0
+
+        capture_summary = _summarize_vision_navigation_capture_response(capture_response)
+        viewport_state = capture_summary.get("viewport_state", {})
+        if not isinstance(viewport_state, Mapping):
+            viewport_state = {}
+        observe_payload = {
+            "schema_version": 1,
+            "kind": "vision_navigation_observe",
+            "run_id": run_id,
+            "session_id": session_id,
+            "iteration": iteration,
+            "captured_at_utc": utc_now_iso(),
+            "intent": SUPPORTED_VISION_NAVIGATION_INTENT,
+            "goal": result["vision_navigation"]["goal"],
+            "success_criteria": {"timeout_seconds": timeout_seconds, "completion_state": "goal_reached", "success_mode": success_mode},
+            "failure_criteria": {"input_failure_limit": input_failure_limit, "capture_failure_limit": capture_failure_limit},
+            "loop": result["vision_navigation"]["loop"],
+            "capture": result["vision_navigation"]["capture"],
+            "decision_bridge": result["vision_navigation"]["decision_bridge"],
+            "observation": {"player_state": dict(player_state), "spatial_state": dict(spatial_state), "capture": dict(capture_summary), "position_target": dict(goal_position_target) if goal_position_target is not None else None},
+        }
+        record["observation"] = dict(observe_payload["observation"])
+        _write_json(observe_path, observe_payload)
+        _write_vision_navigation_bridge_lock(lock_path, run_id=run_id, session_id=session_id, iteration=iteration, status="waiting_for_decision")
+
+        position_ready, position_eval, position_condition = _evaluate_vision_navigation_success(success_mode=success_mode, decision={"success": False, "status": "continue"}, player_state=player_state, goal_position_target=goal_position_target, viewport_state=viewport_state)
+        if position_ready:
+            decision_payload = {"schema_version": 1, "run_id": run_id, "session_id": session_id, "iteration": iteration, "status": "success", "success": True, "success_mode": "position", "success_condition": position_condition, "reason": "position target reached before decision phase", "actions": []}
+            record["decision"] = dict(decision_payload)
+            record["success_evaluation"] = dict(position_eval)
+            record["status"] = "passed"
+            record["ended_at_utc"] = utc_now_iso()
+            record["duration_seconds"] = round(max(0.0, time.monotonic() - float(record["started_at_monotonic"])), 3)
+            record.pop("started_at_monotonic", None)
+            result["success"]["success_condition"] = position_condition
+            result["success"]["target_alive"] = None
+            result["final_state"]["player_state"] = dict(player_state)
+            result["final_state"]["spatial_state"] = dict(spatial_state)
+            result["final_state"]["vision_navigation"] = {"goal_position_target": dict(goal_position_target) if goal_position_target is not None else None, "viewport_state": dict(viewport_state), "success_mode": success_mode, "success_condition": position_condition}
+            result["vision_navigation"]["final_observation"] = dict(observe_payload["observation"])
+            result["vision_navigation"]["final_decision"] = dict(decision_payload)
+            result["vision_navigation"]["success_evaluation"] = dict(position_eval)
+            result["checks"]["vision_navigation"] = True
+            result["checks"]["scenario_flow"] = True
+            _write_vision_navigation_bridge_lock(lock_path, run_id=run_id, session_id=session_id, iteration=iteration, status="completed", details={"success_condition": position_condition, "outcome": "position"})
+            _finalize_step_record(step, status="passed", observation=result["vision_navigation"], started_at_monotonic=step_started_at_monotonic)
+            return
+
+        decision_payload = _wait_for_decision(iteration)
+        record["decision"] = dict(decision_payload)
+        _write_vision_navigation_bridge_lock(lock_path, run_id=run_id, session_id=session_id, iteration=iteration, status="decision_ready", details={"status": decision_payload.get("status"), "success": decision_payload.get("success")})
+        if str(decision_payload.get("status", "")).strip().lower() == "failure":
+            _fail("decision_failure", str(decision_payload.get("reason", "Vision decision reported failure.")), details={"iteration": iteration, "decision": decision_payload}, record=record)
+
+        actions = decision_payload.get("actions", [])
+        if not isinstance(actions, Sequence) or isinstance(actions, (str, bytes)):
+            _fail("decision_validation_failed", "Vision decision actions must be an array.", details={"iteration": iteration}, record=record)
+
+        retry_iteration = False
+        for action_index, action in enumerate(actions):
+            action_name = str(action.get("action", "")).strip()
+            normalized_args = _normalize_vision_navigation_action(action)
+            action_record: Dict[str, Any] = {"index": action_index + 1, "action": action_name, "request_args": dict(normalized_args), "accepted": None, "duration_seconds": None, "error_code": None, "error_message": None}
+            record["actions"].append(action_record)
+            _write_vision_navigation_bridge_lock(lock_path, run_id=run_id, session_id=session_id, iteration=iteration, status="acting", details={"action_index": action_index + 1, "action": action_name})
+
+            if action_name == "wait":
+                started_action = time.monotonic()
+                time.sleep(max(0.0, _safe_float(normalized_args.get("seconds"), 0.0)))
+                action_record["accepted"] = True
+                action_record["duration_seconds"] = round(max(0.0, time.monotonic() - started_action), 3)
+                if action_timeout_seconds > 0.0 and action_record["duration_seconds"] > action_timeout_seconds:
+                    _fail("action_timeout_exceeded", f"Wait action exceeded action_timeout_seconds ({action_timeout_seconds}).", details={"iteration": iteration, "action_index": action_index + 1, "duration_seconds": action_record["duration_seconds"]}, record=record)
+                continue
+
+            started_action = time.monotonic()
+            response = _send_command(client, session_id=session_id, command=action_name, request_args=normalized_args)
+            action_record["accepted"] = bool(response.get("accepted", False))
+            action_record["duration_seconds"] = round(max(0.0, time.monotonic() - started_action), 3)
+            action_record["error_code"] = response.get("error_code")
+            action_record["error_message"] = response.get("error_message")
+            if action_timeout_seconds > 0.0 and action_record["duration_seconds"] > action_timeout_seconds:
+                _fail("action_timeout_exceeded", f"{action_name} exceeded action_timeout_seconds ({action_timeout_seconds}).", details={"iteration": iteration, "action_index": action_index + 1, "duration_seconds": action_record["duration_seconds"]}, response=response, record=record)
+            if not action_record["accepted"]:
+                error_code = str(response.get("error_code", "command_rejected"))
+                if error_code == "input_execution_failed":
+                    consecutive_input_failures += 1
+                    if consecutive_input_failures >= input_failure_limit:
+                        _fail("input_execution_failed_limit", "Vision navigation failed repeatedly due to input execution errors.", details={"iteration": iteration, "input_failure_limit": input_failure_limit, "last_error_message": response.get("error_message")}, response=response, record=record)
+                    record["failure"] = {"code": error_code, "message": str(response.get("error_message", f"{action_name} command was rejected.")), "retryable": True}
+                    retry_iteration = True
+                    break
+                _fail(error_code, str(response.get("error_message", f"{action_name} command was rejected.")), details={"iteration": iteration, "action_index": action_index + 1, "error_stage": response.get("error_stage")}, response=response, record=record)
+            consecutive_input_failures = 0
+
+        if retry_iteration:
+            record["status"] = "retryable_failure"
+            record["ended_at_utc"] = utc_now_iso()
+            record["duration_seconds"] = round(max(0.0, time.monotonic() - float(record["started_at_monotonic"])), 3)
+            record.pop("started_at_monotonic", None)
+            _write_vision_navigation_bridge_lock(lock_path, run_id=run_id, session_id=session_id, iteration=iteration, status="retry_pending", details={"reason": "input_execution_failed", "consecutive_input_failures": consecutive_input_failures})
+            time.sleep(observe_interval_seconds)
+            continue
+
+        try:
+            final_player_state = client.get_player_state(session_id=session_id)
+            final_spatial_state = client.get_spatial_state(session_id=session_id)
+        except UnrealTestClientError as exc:
+            _fail("state_query_failed", f"Failed to read navigation state after actions: {exc}", details={"iteration": iteration}, record=record)
+
+        position_ready, success_eval, success_condition = _evaluate_vision_navigation_success(success_mode=success_mode, decision=decision_payload, player_state=final_player_state, goal_position_target=goal_position_target, viewport_state=viewport_state)
+        record["success_evaluation"] = dict(success_eval)
+        result["final_state"]["player_state"] = dict(final_player_state)
+        result["final_state"]["spatial_state"] = dict(final_spatial_state)
+        result["final_state"]["vision_navigation"] = {"goal_position_target": dict(goal_position_target) if goal_position_target is not None else None, "viewport_state": dict(viewport_state), "success_mode": success_mode, "success_condition": success_condition}
+
+        if position_ready:
+            record["status"] = "passed"
+            record["ended_at_utc"] = utc_now_iso()
+            record["duration_seconds"] = round(max(0.0, time.monotonic() - float(record["started_at_monotonic"])), 3)
+            record.pop("started_at_monotonic", None)
+            result["success"]["success_condition"] = success_condition
+            result["success"]["target_alive"] = None
+            result["vision_navigation"]["final_observation"] = dict(observe_payload["observation"])
+            result["vision_navigation"]["final_decision"] = dict(decision_payload)
+            result["vision_navigation"]["success_evaluation"] = dict(success_eval)
+            result["checks"]["vision_navigation"] = True
+            result["checks"]["scenario_flow"] = True
+            _write_vision_navigation_bridge_lock(lock_path, run_id=run_id, session_id=session_id, iteration=iteration, status="completed", details={"success_condition": success_condition, "outcome": "success"})
+            _finalize_step_record(step, status="passed", observation=result["vision_navigation"], started_at_monotonic=step_started_at_monotonic)
+            result["notes"].append(f"vision_navigation_success_condition:{success_condition}")
+            return
+
+        record["status"] = "running"
+        record["ended_at_utc"] = utc_now_iso()
+        record["duration_seconds"] = round(max(0.0, time.monotonic() - float(record["started_at_monotonic"])), 3)
+        record.pop("started_at_monotonic", None)
+        _write_vision_navigation_bridge_lock(lock_path, run_id=run_id, session_id=session_id, iteration=iteration, status="continue", details={"success_mode": success_mode, "position_reached": success_eval.get("position_reached"), "visual_ready": success_eval.get("visual_ready")})
+        time.sleep(observe_interval_seconds)
+
+    _fail("goal_not_reached", "Vision navigation did not reach the goal condition.", details={"max_iterations": max_iterations})
 
 
 def _run_movement_jump_sequence(
@@ -1054,9 +1984,11 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
             "health": False,
             "capabilities": False,
             "session_start": False,
+            "session_ready": False,
             "equip": False,
             "approach": False,
             "attack": False,
+            "vision_navigation": False,
             "scenario_flow": False,
             "session_stop": False,
         },
@@ -1172,7 +2104,103 @@ def run_e2e(args: argparse.Namespace) -> Dict[str, Any]:
                     "Rebuild UnrealAgentTest module and retry."
                 )
 
+        session_ready_config = scenario_definition.get("session_ready", {})
+        if not isinstance(session_ready_config, Mapping):
+            session_ready_config = {}
+        session_ready_enabled = bool(session_ready_config.get("enabled", args.session_ready_gate))
+        session_ready_timeout_seconds = max(
+            0.1,
+            _safe_float(session_ready_config.get("timeout_seconds"), args.session_ready_timeout_seconds),
+        )
+        session_ready_poll_interval_seconds = max(
+            0.05,
+            _safe_float(
+                session_ready_config.get("poll_interval_seconds"),
+                args.session_ready_poll_interval_seconds,
+            ),
+        )
+        session_ready_capture_timeout_seconds = max(
+            0.5,
+            _safe_float(
+                session_ready_config.get("capture_timeout_seconds"),
+                args.session_ready_capture_timeout_seconds,
+            ),
+        )
+        session_ready_stable_capture_count = max(
+            1,
+            _safe_int(
+                session_ready_config.get("stable_capture_count"),
+                args.session_ready_stable_capture_count,
+            ),
+        )
+        session_ready_require_capture = bool(
+            session_ready_config.get(
+                "require_capture",
+                scenario_intent == SUPPORTED_VISION_NAVIGATION_INTENT,
+            )
+        )
+        capture_config_for_ready = scenario_definition.get("capture", {})
+        if not isinstance(capture_config_for_ready, Mapping):
+            capture_config_for_ready = {}
+
+        if session_ready_enabled:
+            session_ready_summary = _wait_for_session_ready(
+                client,
+                session_id=session_id,
+                timeout_seconds=session_ready_timeout_seconds,
+                poll_interval_seconds=session_ready_poll_interval_seconds,
+                require_capture_ready=session_ready_require_capture,
+                capture_timeout_seconds=session_ready_capture_timeout_seconds,
+                stable_capture_count=session_ready_stable_capture_count,
+                capture_config=capture_config_for_ready,
+            )
+            result["session_ready"] = session_ready_summary
+            if bool(session_ready_summary.get("ready", False)):
+                result["checks"]["session_ready"] = True
+                result["notes"].append(
+                    "session_ready_gate_passed:"
+                    + json.dumps(
+                        {
+                            "elapsed_seconds": session_ready_summary.get("elapsed_seconds"),
+                            "attempts": session_ready_summary.get("attempts"),
+                            "stable_capture_hits": session_ready_summary.get("stable_capture_hits"),
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+            else:
+                raise E2ERunnerError(
+                    "Session ready gate timed out before world/player/capture became ready."
+                )
+        else:
+            result["checks"]["session_ready"] = True
+            result["session_ready"] = {
+                "ready": True,
+                "enabled": False,
+                "reason": "disabled_by_configuration",
+            }
+            result["notes"].append("session_ready_gate_disabled")
+
         cursor = _safe_sequence(client.get_events(session_id=session_id, limit=1).get("last_sequence"), 0)
+
+        if scenario_intent == SUPPORTED_VISION_NAVIGATION_INTENT:
+            _run_vision_navigation(
+                client,
+                result,
+                run_id=run_id,
+                run_dir=run_dir,
+                session_id=session_id,
+                scenario_definition=scenario_definition,
+                poll_interval=args.poll_interval,
+                request_timeout=args.request_timeout,
+            )
+            stop_response = client.stop_session(session_id=session_id)
+            result["session_stop"] = stop_response
+            result["checks"]["session_stop"] = bool(stop_response.get("accepted", False))
+            started_session = False
+            result["ok"] = True
+            return result
 
         if scenario_intent == SUPPORTED_WORKFLOW_INTENT:
             _run_workflow_steps(
@@ -1580,6 +2608,43 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "Fail fast when session_start does not expose auto_play_editor status fields. "
             "Use this to enforce rebuilt server binaries."
         ),
+    )
+    parser.add_argument(
+        "--session-ready-gate",
+        dest="session_ready_gate",
+        action="store_true",
+        default=True,
+        help="Wait for player/world readiness before starting scenario execution (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-session-ready-gate",
+        dest="session_ready_gate",
+        action="store_false",
+        help="Disable session readiness gate.",
+    )
+    parser.add_argument(
+        "--session-ready-timeout-seconds",
+        type=float,
+        default=20.0,
+        help="Timeout for session readiness gate.",
+    )
+    parser.add_argument(
+        "--session-ready-poll-interval-seconds",
+        type=float,
+        default=0.25,
+        help="Polling interval for session readiness gate.",
+    )
+    parser.add_argument(
+        "--session-ready-capture-timeout-seconds",
+        type=float,
+        default=2.0,
+        help="Capture timeout used by session readiness gate when capture readiness is required.",
+    )
+    parser.add_argument(
+        "--session-ready-stable-capture-count",
+        type=int,
+        default=2,
+        help="Required number of consecutive successful captures for session readiness.",
     )
     parser.add_argument(
         "--scenario-json",

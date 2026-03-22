@@ -7,6 +7,13 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Engine/Engine.h"
+#include "Engine/GameViewportClient.h"
+#include "Engine/SceneCapture2D.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "Components/SceneCaptureComponent2D.h"
+#include "Camera/PlayerCameraManager.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
 #include "HttpPath.h"
 #include "HttpServerModule.h"
 #include "HttpServerResponse.h"
@@ -21,6 +28,10 @@
 #include "Misc/SecureHash.h"
 #include "HAL/PlatformTime.h"
 #include "Modules/ModuleManager.h"
+#include "RHI.h"
+#include "Slate/SceneViewport.h"
+#include "Widgets/SWindow.h"
+#include "IImageWrapperModule.h"
 #include "SocketSubsystemModule.h"
 #include "SocketSubsystem.h"
 #include "Sockets.h"
@@ -454,6 +465,546 @@ namespace
 		FJsonSerializer::Serialize(BuildEventJsonObject(Event), Writer);
 		return Output;
 	}
+
+	struct FViewportScreenshotCaptureResult
+	{
+		bool bSucceeded = false;
+		bool bHasViewportState = false;
+		bool bIsMinimized = false;
+		bool bIsOccluded = false;
+		bool bIsFocused = false;
+		int32 ViewportWidth = 0;
+		int32 ViewportHeight = 0;
+		FString CaptureSource;
+		FString ErrorCode;
+		FString ErrorMessage;
+		TArray<FColor> SourcePixels;
+	};
+
+	struct FViewportScreenshotDispatchState : public TSharedFromThis<FViewportScreenshotDispatchState, ESPMode::ThreadSafe>
+	{
+		FEvent* CompletionEvent = nullptr;
+		FViewportScreenshotCaptureResult Result;
+
+		~FViewportScreenshotDispatchState()
+		{
+			if (CompletionEvent != nullptr)
+			{
+				FPlatformProcess::ReturnSynchEventToPool(CompletionEvent);
+				CompletionEvent = nullptr;
+			}
+		}
+	};
+
+	TSharedRef<FJsonObject> BuildViewportStateJson(const FViewportScreenshotCaptureResult& CaptureResult)
+	{
+		TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+		Json->SetBoolField(TEXT("is_minimized"), CaptureResult.bIsMinimized);
+		Json->SetBoolField(TEXT("is_occluded"), CaptureResult.bIsOccluded);
+		Json->SetBoolField(TEXT("is_focused"), CaptureResult.bIsFocused);
+		Json->SetNumberField(TEXT("viewport_width"), static_cast<double>(CaptureResult.ViewportWidth));
+		Json->SetNumberField(TEXT("viewport_height"), static_cast<double>(CaptureResult.ViewportHeight));
+		Json->SetStringField(TEXT("capture_source"), CaptureResult.CaptureSource);
+		return Json;
+	}
+
+	bool ResizeViewportPixels(
+		const TArray<FColor>& SourcePixels,
+		int32 SourceWidth,
+		int32 SourceHeight,
+		int32 TargetWidth,
+		int32 TargetHeight,
+		TArray<FColor>& OutPixels)
+	{
+		if (SourcePixels.Num() <= 0 || SourceWidth <= 0 || SourceHeight <= 0 || TargetWidth <= 0 || TargetHeight <= 0)
+		{
+			return false;
+		}
+
+		const int64 TargetPixelCount = static_cast<int64>(TargetWidth) * static_cast<int64>(TargetHeight);
+		if (TargetPixelCount <= 0 || TargetPixelCount > static_cast<int64>(MAX_int32))
+		{
+			return false;
+		}
+
+		if (SourceWidth == TargetWidth && SourceHeight == TargetHeight)
+		{
+			OutPixels = SourcePixels;
+			return true;
+		}
+
+		OutPixels.SetNumUninitialized(static_cast<int32>(TargetPixelCount));
+
+		auto SamplePixel = [&SourcePixels, SourceWidth, SourceHeight](int32 X, int32 Y) -> const FColor&
+		{
+			const int32 ClampedX = FMath::Clamp(X, 0, SourceWidth - 1);
+			const int32 ClampedY = FMath::Clamp(Y, 0, SourceHeight - 1);
+			return SourcePixels[ClampedY * SourceWidth + ClampedX];
+		};
+
+		auto LerpColor = [](const FColor& A, const FColor& B, double Alpha) -> FColor
+		{
+			const double ClampedAlpha = FMath::Clamp(Alpha, 0.0, 1.0);
+			FLinearColor LinearA(A);
+			FLinearColor LinearB(B);
+			FLinearColor LinearResult;
+			LinearResult.R = FMath::Lerp(LinearA.R, LinearB.R, static_cast<float>(ClampedAlpha));
+			LinearResult.G = FMath::Lerp(LinearA.G, LinearB.G, static_cast<float>(ClampedAlpha));
+			LinearResult.B = FMath::Lerp(LinearA.B, LinearB.B, static_cast<float>(ClampedAlpha));
+			LinearResult.A = FMath::Lerp(LinearA.A, LinearB.A, static_cast<float>(ClampedAlpha));
+			return LinearResult.ToFColor(false);
+		};
+
+		const double XScale = (TargetWidth > 1) ? static_cast<double>(SourceWidth - 1) / static_cast<double>(TargetWidth - 1) : 0.0;
+		const double YScale = (TargetHeight > 1) ? static_cast<double>(SourceHeight - 1) / static_cast<double>(TargetHeight - 1) : 0.0;
+
+		for (int32 TargetY = 0; TargetY < TargetHeight; ++TargetY)
+		{
+			const double SourceY = YScale * static_cast<double>(TargetY);
+			const int32 Y0 = FMath::Clamp(FMath::FloorToInt(SourceY), 0, SourceHeight - 1);
+			const int32 Y1 = FMath::Clamp(Y0 + 1, 0, SourceHeight - 1);
+			const double YAlpha = SourceY - static_cast<double>(Y0);
+
+			for (int32 TargetX = 0; TargetX < TargetWidth; ++TargetX)
+			{
+				const double SourceX = XScale * static_cast<double>(TargetX);
+				const int32 X0 = FMath::Clamp(FMath::FloorToInt(SourceX), 0, SourceWidth - 1);
+				const int32 X1 = FMath::Clamp(X0 + 1, 0, SourceWidth - 1);
+				const double XAlpha = SourceX - static_cast<double>(X0);
+
+				const FColor TopLeft = SamplePixel(X0, Y0);
+				const FColor TopRight = SamplePixel(X1, Y0);
+				const FColor BottomLeft = SamplePixel(X0, Y1);
+				const FColor BottomRight = SamplePixel(X1, Y1);
+
+				const FColor Top = LerpColor(TopLeft, TopRight, XAlpha);
+				const FColor Bottom = LerpColor(BottomLeft, BottomRight, XAlpha);
+				OutPixels[TargetY * TargetWidth + TargetX] = LerpColor(Top, Bottom, YAlpha);
+			}
+		}
+
+		return true;
+	}
+
+	bool TryCaptureViewportPixelsOnGameThread(FViewportScreenshotCaptureResult& OutResult)
+	{
+		OutResult = FViewportScreenshotCaptureResult();
+
+		if (GEngine == nullptr)
+		{
+			OutResult.ErrorCode = TEXT("capture_unavailable");
+			OutResult.ErrorMessage = TEXT("GEngine is not available.");
+			return false;
+		}
+
+		for (const FWorldContext& WorldContext : GEngine->GetWorldContexts())
+		{
+			UWorld* World = WorldContext.World();
+			if (World == nullptr || !World->IsGameWorld() || World->GetFirstPlayerController() == nullptr)
+			{
+				continue;
+			}
+
+			UGameViewportClient* GameViewportClient = WorldContext.GameViewport;
+			if (GameViewportClient == nullptr)
+			{
+				GameViewportClient = GEngine->GameViewport;
+			}
+
+			FViewport* Viewport = (GameViewportClient != nullptr) ? GameViewportClient->Viewport : nullptr;
+			if (Viewport == nullptr)
+			{
+				continue;
+			}
+
+			OutResult.bHasViewportState = true;
+			OutResult.CaptureSource = (WorldContext.WorldType == EWorldType::PIE) ? TEXT("pie_viewport") : TEXT("game_viewport");
+			OutResult.ViewportWidth = Viewport->GetSizeXY().X;
+			OutResult.ViewportHeight = Viewport->GetSizeXY().Y;
+			OutResult.bIsFocused = Viewport->HasFocus();
+			OutResult.bIsOccluded = !Viewport->IsForegroundWindow();
+
+			if (FSceneViewport* SceneViewport = static_cast<FSceneViewport*>(Viewport))
+			{
+				TSharedPtr<SWindow> ViewportWindow = SceneViewport->FindWindow();
+				OutResult.bIsMinimized = ViewportWindow.IsValid() && ViewportWindow->IsWindowMinimized();
+			}
+
+			if (OutResult.bIsMinimized)
+			{
+				OutResult.ErrorCode = TEXT("viewport_minimized");
+				OutResult.ErrorMessage = TEXT("The target viewport is minimized.");
+				return false;
+			}
+
+			if (OutResult.ViewportWidth <= 0 || OutResult.ViewportHeight <= 0)
+			{
+				OutResult.ErrorCode = TEXT("capture_unavailable");
+				OutResult.ErrorMessage = TEXT("The target viewport size is invalid.");
+				return false;
+			}
+
+			const int64 PixelCount64 = static_cast<int64>(OutResult.ViewportWidth) * static_cast<int64>(OutResult.ViewportHeight);
+			if (PixelCount64 <= 0 || PixelCount64 > static_cast<int64>(MAX_int32))
+			{
+				OutResult.ErrorCode = TEXT("capture_unavailable");
+				OutResult.ErrorMessage = TEXT("The target viewport is too large to capture.");
+				return false;
+			}
+
+			TArray<FColor> Pixels;
+			Pixels.Reserve(static_cast<int32>(PixelCount64));
+
+			FReadSurfaceDataFlags ReadFlags(RCM_UNorm);
+			ReadFlags.SetLinearToGamma(false);
+
+			if (!Viewport->ReadPixels(Pixels, ReadFlags, FIntRect(0, 0, OutResult.ViewportWidth, OutResult.ViewportHeight)))
+			{
+				OutResult.ErrorCode = TEXT("capture_unavailable");
+				OutResult.ErrorMessage = TEXT("Failed to read pixels from the target viewport.");
+				return false;
+			}
+
+			if (Pixels.Num() != static_cast<int32>(PixelCount64))
+			{
+				OutResult.ErrorCode = TEXT("capture_unavailable");
+				OutResult.ErrorMessage = TEXT("The viewport returned an unexpected pixel count.");
+				return false;
+			}
+
+			OutResult.SourcePixels = MoveTemp(Pixels);
+			OutResult.bSucceeded = true;
+			return true;
+		}
+
+		OutResult.ErrorCode = TEXT("capture_unavailable");
+		OutResult.ErrorMessage = TEXT("No active game or PIE viewport could be found.");
+		return false;
+	}
+
+	bool TryCaptureSceneViewPixelsOnGameThread(FViewportScreenshotCaptureResult& OutResult)
+	{
+		OutResult = FViewportScreenshotCaptureResult();
+
+		if (GEngine == nullptr)
+		{
+			OutResult.ErrorCode = TEXT("capture_unavailable");
+			OutResult.ErrorMessage = TEXT("GEngine is not available.");
+			return false;
+		}
+
+		for (const FWorldContext& WorldContext : GEngine->GetWorldContexts())
+		{
+			UWorld* World = WorldContext.World();
+			if (World == nullptr || !World->IsGameWorld())
+			{
+				continue;
+			}
+
+			APlayerController* PlayerController = World->GetFirstPlayerController();
+			if (PlayerController == nullptr)
+			{
+				continue;
+			}
+
+			int32 CaptureWidth = 1280;
+			int32 CaptureHeight = 720;
+			bool bIsMinimized = false;
+			bool bIsFocused = false;
+			bool bIsOccluded = false;
+
+			UGameViewportClient* GameViewportClient = WorldContext.GameViewport;
+			if (GameViewportClient == nullptr)
+			{
+				GameViewportClient = GEngine->GameViewport;
+			}
+			FViewport* Viewport = (GameViewportClient != nullptr) ? GameViewportClient->Viewport : nullptr;
+			if (Viewport != nullptr)
+			{
+				const FIntPoint ViewportSize = Viewport->GetSizeXY();
+				CaptureWidth = FMath::Max(1, ViewportSize.X);
+				CaptureHeight = FMath::Max(1, ViewportSize.Y);
+				bIsFocused = Viewport->HasFocus();
+				bIsOccluded = !Viewport->IsForegroundWindow();
+
+				if (FSceneViewport* SceneViewport = static_cast<FSceneViewport*>(Viewport))
+				{
+					TSharedPtr<SWindow> ViewportWindow = SceneViewport->FindWindow();
+					bIsMinimized = ViewportWindow.IsValid() && ViewportWindow->IsWindowMinimized();
+				}
+			}
+
+			OutResult.bHasViewportState = true;
+			OutResult.bIsMinimized = bIsMinimized;
+			OutResult.bIsFocused = bIsFocused;
+			OutResult.bIsOccluded = bIsOccluded;
+			OutResult.ViewportWidth = CaptureWidth;
+			OutResult.ViewportHeight = CaptureHeight;
+			OutResult.CaptureSource = (WorldContext.WorldType == EWorldType::PIE) ? TEXT("scene_capture_2d_pie") : TEXT("scene_capture_2d_game");
+
+			if (OutResult.bIsMinimized)
+			{
+				OutResult.ErrorCode = TEXT("viewport_minimized");
+				OutResult.ErrorMessage = TEXT("The target viewport is minimized.");
+				return false;
+			}
+
+			FVector ViewLocation = FVector::ZeroVector;
+			FRotator ViewRotation = FRotator::ZeroRotator;
+			bool bHasViewTransform = false;
+			if (APlayerCameraManager* CameraManager = PlayerController->PlayerCameraManager)
+			{
+				CameraManager->GetCameraViewPoint(ViewLocation, ViewRotation);
+				bHasViewTransform = true;
+			}
+
+			if (!bHasViewTransform)
+			{
+				if (APawn* Pawn = PlayerController->GetPawn())
+				{
+					ViewLocation = Pawn->GetActorLocation();
+					ViewRotation = PlayerController->GetControlRotation();
+					bHasViewTransform = true;
+				}
+			}
+
+			if (!bHasViewTransform)
+			{
+				OutResult.ErrorCode = TEXT("capture_unavailable");
+				OutResult.ErrorMessage = TEXT("Could not resolve player camera transform.");
+				return false;
+			}
+
+			FActorSpawnParameters SpawnParams;
+			SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+			SpawnParams.ObjectFlags |= RF_Transient;
+			ASceneCapture2D* CaptureActor = World->SpawnActor<ASceneCapture2D>(ASceneCapture2D::StaticClass(), ViewLocation, ViewRotation, SpawnParams);
+			if (CaptureActor == nullptr)
+			{
+				OutResult.ErrorCode = TEXT("capture_unavailable");
+				OutResult.ErrorMessage = TEXT("Failed to spawn SceneCapture2D actor.");
+				return false;
+			}
+
+			auto DestroyCaptureActor = [&CaptureActor]()
+			{
+				if (CaptureActor != nullptr)
+				{
+					CaptureActor->Destroy();
+					CaptureActor = nullptr;
+				}
+			};
+
+			USceneCaptureComponent2D* CaptureComponent = CaptureActor->GetCaptureComponent2D();
+			if (CaptureComponent == nullptr)
+			{
+				DestroyCaptureActor();
+				OutResult.ErrorCode = TEXT("capture_unavailable");
+				OutResult.ErrorMessage = TEXT("SceneCapture2D component is not available.");
+				return false;
+			}
+
+			UTextureRenderTarget2D* RenderTarget = NewObject<UTextureRenderTarget2D>(CaptureActor, NAME_None, RF_Transient);
+			if (RenderTarget == nullptr)
+			{
+				DestroyCaptureActor();
+				OutResult.ErrorCode = TEXT("capture_unavailable");
+				OutResult.ErrorMessage = TEXT("Failed to allocate render target for scene capture.");
+				return false;
+			}
+
+			RenderTarget->bAutoGenerateMips = false;
+			RenderTarget->ClearColor = FLinearColor::Black;
+			RenderTarget->InitCustomFormat(CaptureWidth, CaptureHeight, PF_B8G8R8A8, false);
+			RenderTarget->UpdateResourceImmediate(true);
+
+			CaptureComponent->TextureTarget = RenderTarget;
+			CaptureComponent->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+			CaptureComponent->bCaptureEveryFrame = false;
+			CaptureComponent->bCaptureOnMovement = false;
+			CaptureComponent->SetWorldLocationAndRotation(ViewLocation, ViewRotation);
+			if (APlayerCameraManager* CameraManager = PlayerController->PlayerCameraManager)
+			{
+				CaptureComponent->FOVAngle = CameraManager->GetFOVAngle();
+			}
+
+			CaptureComponent->CaptureScene();
+			FlushRenderingCommands();
+
+			FTextureRenderTargetResource* RenderTargetResource = RenderTarget->GameThread_GetRenderTargetResource();
+			if (RenderTargetResource == nullptr)
+			{
+				DestroyCaptureActor();
+				OutResult.ErrorCode = TEXT("capture_unavailable");
+				OutResult.ErrorMessage = TEXT("Render target resource is not available.");
+				return false;
+			}
+
+			TArray<FColor> Pixels;
+			FReadSurfaceDataFlags ReadFlags(RCM_UNorm);
+			ReadFlags.SetLinearToGamma(false);
+			if (!RenderTargetResource->ReadPixels(Pixels, ReadFlags))
+			{
+				DestroyCaptureActor();
+				OutResult.ErrorCode = TEXT("capture_unavailable");
+				OutResult.ErrorMessage = TEXT("Failed to read pixels from scene capture render target.");
+				return false;
+			}
+
+			const int64 ExpectedPixelCount = static_cast<int64>(CaptureWidth) * static_cast<int64>(CaptureHeight);
+			if (Pixels.Num() != static_cast<int32>(ExpectedPixelCount))
+			{
+				DestroyCaptureActor();
+				OutResult.ErrorCode = TEXT("capture_unavailable");
+				OutResult.ErrorMessage = TEXT("Scene capture returned an unexpected pixel count.");
+				return false;
+			}
+
+			OutResult.SourcePixels = MoveTemp(Pixels);
+			OutResult.bSucceeded = true;
+
+			DestroyCaptureActor();
+			return true;
+		}
+
+		OutResult.ErrorCode = TEXT("capture_unavailable");
+		OutResult.ErrorMessage = TEXT("No active game or PIE world with a player controller could be found.");
+		return false;
+	}
+
+	bool TryCaptureViewportScreenshot(FViewportScreenshotCaptureResult& OutResult, double TimeoutSeconds)
+	{
+		if (IsInGameThread())
+		{
+			FViewportScreenshotCaptureResult SceneCaptureResult;
+			if (TryCaptureSceneViewPixelsOnGameThread(SceneCaptureResult))
+			{
+				OutResult = MoveTemp(SceneCaptureResult);
+				return true;
+			}
+
+			FViewportScreenshotCaptureResult ViewportCaptureResult;
+			if (TryCaptureViewportPixelsOnGameThread(ViewportCaptureResult))
+			{
+				OutResult = MoveTemp(ViewportCaptureResult);
+				return true;
+			}
+
+			OutResult = MoveTemp(SceneCaptureResult);
+			if (OutResult.ErrorCode.IsEmpty() && !ViewportCaptureResult.ErrorCode.IsEmpty())
+			{
+				OutResult = MoveTemp(ViewportCaptureResult);
+			}
+			return false;
+		}
+
+		TSharedRef<FViewportScreenshotDispatchState, ESPMode::ThreadSafe> DispatchState = MakeShared<FViewportScreenshotDispatchState, ESPMode::ThreadSafe>();
+		DispatchState->CompletionEvent = FPlatformProcess::GetSynchEventFromPool(false);
+		if (DispatchState->CompletionEvent == nullptr)
+		{
+			OutResult.ErrorCode = TEXT("capture_unavailable");
+			OutResult.ErrorMessage = TEXT("Failed to allocate a synchronization event.");
+			return false;
+		}
+
+		AsyncTask(ENamedThreads::GameThread, [DispatchState]()
+		{
+			TryCaptureViewportScreenshot(DispatchState->Result, 0.0);
+			if (DispatchState->CompletionEvent != nullptr)
+			{
+				DispatchState->CompletionEvent->Trigger();
+			}
+		});
+
+		const bool bCompleted = DispatchState->CompletionEvent->Wait(FTimespan::FromSeconds(FMath::Max(0.0, TimeoutSeconds)));
+		if (!bCompleted)
+		{
+			OutResult.ErrorCode = TEXT("capture_timeout");
+			OutResult.ErrorMessage = TEXT("Timed out while waiting for the viewport capture to complete.");
+			return false;
+		}
+
+		OutResult = MoveTemp(DispatchState->Result);
+		return OutResult.bSucceeded;
+	}
+
+	bool EncodeScreenshotToBase64Jpeg(
+		const TArray<FColor>& SourcePixels,
+		int32 SourceWidth,
+		int32 SourceHeight,
+		int32 TargetHeight,
+		bool bPreserveAspectRatio,
+		int32 JpegQuality,
+		FString& OutImageBase64,
+		int32& OutWidth,
+		int32& OutHeight,
+		FString& OutErrorCode,
+		FString& OutErrorMessage)
+	{
+		OutImageBase64.Reset();
+		OutWidth = 0;
+		OutHeight = 0;
+		OutErrorCode.Reset();
+		OutErrorMessage.Reset();
+
+		if (SourcePixels.Num() <= 0 || SourceWidth <= 0 || SourceHeight <= 0 || TargetHeight <= 0)
+		{
+			OutErrorCode = TEXT("capture_unavailable");
+			OutErrorMessage = TEXT("Invalid source or target dimensions for screenshot encoding.");
+			return false;
+		}
+
+		const int32 ClampedQuality = FMath::Clamp(JpegQuality, 1, 100);
+		const int32 OutputHeight = FMath::Max(1, TargetHeight);
+		const int32 OutputWidth = bPreserveAspectRatio
+			? FMath::Max(1, FMath::RoundToInt(static_cast<double>(SourceWidth) * (static_cast<double>(OutputHeight) / static_cast<double>(SourceHeight))))
+			: FMath::Max(1, SourceWidth);
+
+		TArray<FColor> OutputPixels;
+		if (!ResizeViewportPixels(SourcePixels, SourceWidth, SourceHeight, OutputWidth, OutputHeight, OutputPixels))
+		{
+			OutErrorCode = TEXT("capture_unavailable");
+			OutErrorMessage = TEXT("Failed to resize the screenshot.");
+			return false;
+		}
+
+		IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+		TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::JPEG);
+		if (!ImageWrapper.IsValid())
+		{
+			OutErrorCode = TEXT("capture_unavailable");
+			OutErrorMessage = TEXT("Failed to create a JPEG image wrapper.");
+			return false;
+		}
+
+		if (!ImageWrapper->SetRaw(
+				OutputPixels.GetData(),
+				static_cast<int64>(OutputPixels.Num()) * static_cast<int64>(sizeof(FColor)),
+				OutputWidth,
+				OutputHeight,
+				ERGBFormat::BGRA,
+				8))
+		{
+			OutErrorCode = TEXT("capture_unavailable");
+			OutErrorMessage = TEXT("Failed to prepare the screenshot for JPEG encoding.");
+			return false;
+		}
+
+		const TArray64<uint8> CompressedBytes = ImageWrapper->GetCompressed(ClampedQuality);
+		if (CompressedBytes.Num() <= 0)
+		{
+			OutErrorCode = TEXT("capture_unavailable");
+			OutErrorMessage = TEXT("JPEG compression returned no data.");
+			return false;
+		}
+
+		OutImageBase64 = FBase64::Encode(
+			reinterpret_cast<const uint8*>(CompressedBytes.GetData()),
+			static_cast<int32>(CompressedBytes.Num()));
+		OutWidth = OutputWidth;
+		OutHeight = OutputHeight;
+		return true;
+	}
 }
 
 struct FGameTestWebSocketClient
@@ -853,6 +1404,11 @@ bool FGameTestRemoteServer::BindRoutes()
 		FHttpRequestHandler::CreateRaw(this, &FGameTestRemoteServer::HandleCommandExecute)));
 
 	RouteHandles.Add(HttpRouter->BindRoute(
+		FHttpPath(TEXT("/capture/screenshot")),
+		EHttpServerRequestVerbs::VERB_GET,
+		FHttpRequestHandler::CreateRaw(this, &FGameTestRemoteServer::HandleScreenshotCapture)));
+
+	RouteHandles.Add(HttpRouter->BindRoute(
 		FHttpPath(TEXT("/state/player")),
 		EHttpServerRequestVerbs::VERB_GET,
 		FHttpRequestHandler::CreateRaw(this, &FGameTestRemoteServer::HandlePlayerState)));
@@ -872,7 +1428,7 @@ bool FGameTestRemoteServer::BindRoutes()
 		EHttpServerRequestVerbs::VERB_GET,
 		FHttpRequestHandler::CreateRaw(this, &FGameTestRemoteServer::HandleEvents)));
 
-	return RouteHandles.Num() == 9;
+	return RouteHandles.Num() == 10;
 }
 
 void FGameTestRemoteServer::UnbindRoutes()
@@ -918,6 +1474,7 @@ bool FGameTestRemoteServer::HandleCapabilities(const FHttpServerRequest& Request
 	RouteValues.Add(MakeShared<FJsonValueString>(TEXT("POST /session/start")));
 	RouteValues.Add(MakeShared<FJsonValueString>(TEXT("POST /session/stop")));
 	RouteValues.Add(MakeShared<FJsonValueString>(TEXT("POST /command/execute")));
+	RouteValues.Add(MakeShared<FJsonValueString>(TEXT("GET /capture/screenshot")));
 	RouteValues.Add(MakeShared<FJsonValueString>(TEXT("GET /state/player")));
 	RouteValues.Add(MakeShared<FJsonValueString>(TEXT("GET /state/target")));
 	RouteValues.Add(MakeShared<FJsonValueString>(TEXT("GET /state/spatial")));
@@ -934,6 +1491,14 @@ bool FGameTestRemoteServer::HandleCapabilities(const FHttpServerRequest& Request
 	EventQueryFields.Add(MakeShared<FJsonValueString>(TEXT("limit")));
 	EventQueryFields.Add(MakeShared<FJsonValueString>(TEXT("after_sequence")));
 	JsonBody->SetArrayField(TEXT("events_query_fields"), EventQueryFields);
+
+	TArray<TSharedPtr<FJsonValue>> ScreenshotQueryFields;
+	ScreenshotQueryFields.Add(MakeShared<FJsonValueString>(TEXT("session_id")));
+	ScreenshotQueryFields.Add(MakeShared<FJsonValueString>(TEXT("height")));
+	ScreenshotQueryFields.Add(MakeShared<FJsonValueString>(TEXT("preserve_aspect_ratio")));
+	ScreenshotQueryFields.Add(MakeShared<FJsonValueString>(TEXT("jpeg_quality")));
+	JsonBody->SetArrayField(TEXT("capture_screenshot_query_fields"), ScreenshotQueryFields);
+
 	if (!BuildWebSocketUrl().IsEmpty())
 	{
 		JsonBody->SetStringField(TEXT("events_websocket_url"), BuildWebSocketUrl());
@@ -1155,6 +1720,95 @@ bool FGameTestRemoteServer::HandleCommandExecute(const FHttpServerRequest& Reque
 	return true;
 }
 
+bool FGameTestRemoteServer::HandleScreenshotCapture(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
+{
+	FString SessionId;
+	if (!TryGetSessionIdFromQuery(Request, SessionId))
+	{
+		OnComplete(MakeJsonResponse(EHttpServerResponseCodes::BadRequest, MakeErrorJson(TEXT("missing_query"), TEXT("session_id query parameter is required."))));
+		return true;
+	}
+
+	if (!SessionManager.HasSession(SessionId))
+	{
+		TSharedRef<FJsonObject> ErrorJson = MakeErrorJson(TEXT("session_not_found"), TEXT("session_id is not active."));
+		ErrorJson->SetStringField(TEXT("session_id"), SessionId);
+		OnComplete(MakeJsonResponse(EHttpServerResponseCodes::NotFound, ErrorJson));
+		return true;
+	}
+
+	const int32 RequestedHeight = FMath::Max(1, GetPositiveQueryIntOrDefault(Request, TEXT("height"), 360));
+	bool bPreserveAspectRatio = true;
+	(void)TryGetQueryBool(Request, TEXT("preserve_aspect_ratio"), bPreserveAspectRatio);
+	const int32 RequestedJpegQuality = FMath::Clamp(GetPositiveQueryIntOrDefault(Request, TEXT("jpeg_quality"), 60), 1, 100);
+
+	FViewportScreenshotCaptureResult CaptureResult;
+	if (!TryCaptureViewportScreenshot(CaptureResult, 5.0))
+	{
+		const FString ErrorCode = CaptureResult.ErrorCode.IsEmpty() ? TEXT("capture_unavailable") : CaptureResult.ErrorCode;
+		const FString ErrorMessage = CaptureResult.ErrorMessage.IsEmpty()
+			? TEXT("Failed to capture the target viewport.")
+			: CaptureResult.ErrorMessage;
+
+		TSharedRef<FJsonObject> ErrorJson = MakeErrorJson(ErrorCode, ErrorMessage);
+		ErrorJson->SetStringField(TEXT("captured_session_id"), SessionId);
+		ErrorJson->SetNumberField(TEXT("jpeg_quality"), static_cast<double>(RequestedJpegQuality));
+		if (CaptureResult.bHasViewportState)
+		{
+			ErrorJson->SetObjectField(TEXT("viewport_state"), BuildViewportStateJson(CaptureResult));
+		}
+
+		const EHttpServerResponseCodes ResponseCode =
+			(ErrorCode == TEXT("viewport_minimized") || ErrorCode == TEXT("viewport_occluded"))
+				? EHttpServerResponseCodes::Conflict
+				: (ErrorCode == TEXT("capture_timeout") ? EHttpServerResponseCodes::GatewayTimeout : EHttpServerResponseCodes::ServiceUnavail);
+
+		OnComplete(MakeJsonResponse(ResponseCode, ErrorJson));
+		return true;
+	}
+
+	FString ImageBase64;
+	int32 OutputWidth = 0;
+	int32 OutputHeight = 0;
+	FString EncodeErrorCode;
+	FString EncodeErrorMessage;
+	if (!EncodeScreenshotToBase64Jpeg(
+			CaptureResult.SourcePixels,
+			CaptureResult.ViewportWidth,
+			CaptureResult.ViewportHeight,
+			RequestedHeight,
+			bPreserveAspectRatio,
+			RequestedJpegQuality,
+			ImageBase64,
+			OutputWidth,
+			OutputHeight,
+			EncodeErrorCode,
+			EncodeErrorMessage))
+	{
+		TSharedRef<FJsonObject> ErrorJson = MakeErrorJson(
+			EncodeErrorCode.IsEmpty() ? TEXT("capture_unavailable") : EncodeErrorCode,
+			EncodeErrorMessage.IsEmpty() ? TEXT("Failed to encode the captured viewport.") : EncodeErrorMessage);
+		ErrorJson->SetStringField(TEXT("captured_session_id"), SessionId);
+		ErrorJson->SetNumberField(TEXT("jpeg_quality"), static_cast<double>(RequestedJpegQuality));
+		ErrorJson->SetObjectField(TEXT("viewport_state"), BuildViewportStateJson(CaptureResult));
+		OnComplete(MakeJsonResponse(EHttpServerResponseCodes::ServiceUnavail, ErrorJson));
+		return true;
+	}
+
+	TSharedRef<FJsonObject> JsonBody = MakeShared<FJsonObject>();
+	JsonBody->SetBoolField(TEXT("accepted"), true);
+	JsonBody->SetStringField(TEXT("captured_session_id"), SessionId);
+	JsonBody->SetStringField(TEXT("image_format"), TEXT("jpeg"));
+	JsonBody->SetStringField(TEXT("image_base64"), ImageBase64);
+	JsonBody->SetNumberField(TEXT("width"), static_cast<double>(OutputWidth));
+	JsonBody->SetNumberField(TEXT("height"), static_cast<double>(OutputHeight));
+	JsonBody->SetNumberField(TEXT("jpeg_quality"), static_cast<double>(RequestedJpegQuality));
+	JsonBody->SetObjectField(TEXT("viewport_state"), BuildViewportStateJson(CaptureResult));
+
+	OnComplete(MakeJsonResponse(EHttpServerResponseCodes::Ok, JsonBody));
+	return true;
+}
+
 bool FGameTestRemoteServer::HandlePlayerState(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
 {
 	FString SessionId;
@@ -1332,7 +1986,9 @@ TSharedRef<FJsonObject> FGameTestRemoteServer::MakeErrorJson(const FString& Erro
 	TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
 	Json->SetBoolField(TEXT("accepted"), false);
 	Json->SetStringField(TEXT("error"), ErrorCode);
+	Json->SetStringField(TEXT("error_code"), ErrorCode);
 	Json->SetStringField(TEXT("message"), Message);
+	Json->SetStringField(TEXT("error_message"), Message);
 	Json->SetStringField(TEXT("timestamp"), FDateTime::UtcNow().ToIso8601());
 	return Json;
 }

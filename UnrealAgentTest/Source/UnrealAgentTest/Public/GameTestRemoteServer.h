@@ -32,6 +32,7 @@ private:
 	bool HandleSessionStart(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);
 	bool HandleSessionStop(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);
 	bool HandleCommandExecute(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);
+	bool HandleScreenshotCapture(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);
 	bool HandlePlayerState(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);
 	bool HandleTargetState(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);
 	bool HandleSpatialState(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);

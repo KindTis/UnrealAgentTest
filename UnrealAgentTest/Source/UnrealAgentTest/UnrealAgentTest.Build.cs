@@ -40,6 +40,9 @@ public class UnrealAgentTest : ModuleRules
 				"CoreUObject",
 				"Engine",
 				"HTTPServer",
+				"ImageWrapper",
+				"RHI",
+				"RenderCore",
 				"Slate",
 				"SlateCore",
 				// ... add private dependencies that you statically link with here ...	

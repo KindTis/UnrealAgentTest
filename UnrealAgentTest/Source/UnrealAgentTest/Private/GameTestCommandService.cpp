@@ -410,6 +410,14 @@ bool FGameTestCommandService::TryBuildAcceptedResponse(const FGameTestCommandReq
 			return false;
 		}
 	}
+	else if (Request.CommandName == TEXT("camera_yaw"))
+	{
+		if (!ValidateCameraYaw(Request, Response))
+		{
+			OutResponse = Response;
+			return false;
+		}
+	}
 	else if (Request.CommandName == TEXT("execute_recipe"))
 	{
 		if (!ValidateExecuteRecipe(Request, Response))
@@ -432,7 +440,7 @@ bool FGameTestCommandService::TryBuildAcceptedResponse(const FGameTestCommandReq
 			Response.ErrorCode,
 			Response.ErrorMessage,
 			Response.ImplementationStatus);
-		SetResponseDetailsString(Response.Details, TEXT("supported_commands"), TEXT("attack,tap_button,move_stick,release_stick,execute_recipe"));
+		SetResponseDetailsString(Response.Details, TEXT("supported_commands"), TEXT("attack,tap_button,move_stick,release_stick,camera_yaw,execute_recipe"));
 		OutResponse = Response;
 		return false;
 	}
@@ -599,6 +607,57 @@ bool FGameTestCommandService::ValidateReleaseStick(const FGameTestCommandRequest
 
 	SetNormalizedString(OutResponse.Details, TEXT("stick_id"), StickId);
 	SetNormalizedString(OutResponse.Details, TEXT("input_mode"), TEXT("release"));
+	return true;
+}
+
+bool FGameTestCommandService::ValidateCameraYaw(const FGameTestCommandRequest& Request, FGameTestCommandResponse& OutResponse)
+{
+	if (!Request.Arguments.IsValid())
+	{
+		OutResponse.bAccepted = false;
+		OutResponse.ErrorCode = TEXT("missing_field");
+		OutResponse.ErrorMessage = TEXT("degrees or delta_degrees is required.");
+		MarkRejectedDetails(OutResponse.Details, Request.CommandName, Request.TraceId, TEXT("validation"), OutResponse.ErrorCode, OutResponse.ErrorMessage);
+		return false;
+	}
+
+	double Degrees = 0.0;
+	bool bHasDegrees = Request.Arguments->TryGetNumberField(TEXT("degrees"), Degrees);
+	if (!bHasDegrees)
+	{
+		bHasDegrees = Request.Arguments->TryGetNumberField(TEXT("delta_degrees"), Degrees);
+	}
+	if (!bHasDegrees)
+	{
+		OutResponse.bAccepted = false;
+		OutResponse.ErrorCode = TEXT("missing_field");
+		OutResponse.ErrorMessage = TEXT("degrees or delta_degrees is required.");
+		MarkRejectedDetails(OutResponse.Details, Request.CommandName, Request.TraceId, TEXT("validation"), OutResponse.ErrorCode, OutResponse.ErrorMessage);
+		return false;
+	}
+
+	if (!FMath::IsFinite(Degrees))
+	{
+		OutResponse.bAccepted = false;
+		OutResponse.ErrorCode = TEXT("invalid_field");
+		OutResponse.ErrorMessage = TEXT("degrees must be a finite number.");
+		MarkRejectedDetails(OutResponse.Details, Request.CommandName, Request.TraceId, TEXT("validation"), OutResponse.ErrorCode, OutResponse.ErrorMessage);
+		return false;
+	}
+
+	double DurationMs = 120.0;
+	if (Request.Arguments->HasField(TEXT("duration_ms")) && (!Request.Arguments->TryGetNumberField(TEXT("duration_ms"), DurationMs) || DurationMs <= 0.0))
+	{
+		OutResponse.bAccepted = false;
+		OutResponse.ErrorCode = TEXT("invalid_field");
+		OutResponse.ErrorMessage = TEXT("duration_ms must be a positive number when provided.");
+		MarkRejectedDetails(OutResponse.Details, Request.CommandName, Request.TraceId, TEXT("validation"), OutResponse.ErrorCode, OutResponse.ErrorMessage);
+		return false;
+	}
+
+	SetNormalizedNumber(OutResponse.Details, TEXT("degrees"), Degrees);
+	SetNormalizedNumber(OutResponse.Details, TEXT("duration_ms"), DurationMs);
+	SetNormalizedString(OutResponse.Details, TEXT("input_mode"), TEXT("camera_yaw"));
 	return true;
 }
 

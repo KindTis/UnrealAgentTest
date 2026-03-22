@@ -369,6 +369,38 @@ class UnrealTestClient:
         self._append_optional_bool(query, "target_in_attack_range", target_in_attack_range)
         return self._request("GET", "/state/spatial", query=query)
 
+    def get_screenshot(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        query: Optional[Mapping[str, Any]] = None,
+        height: int = 360,
+        preserve_aspect_ratio: bool = True,
+        jpeg_quality: int = 60,
+    ) -> JsonObject:
+        query_params = self._build_query(session_id=session_id)
+        if query is not None:
+            query_params.update(dict(query))
+
+        query_params["height"] = str(int(height))
+        query_params["preserve_aspect_ratio"] = "true" if preserve_aspect_ratio else "false"
+        query_params["jpeg_quality"] = str(int(jpeg_quality))
+        return self._request("GET", "/capture/screenshot", query=query_params, allow_http_error_json=True)
+
+    def capture_viewport(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        height: int = 360,
+        preserve_aspect_ratio: bool = True,
+        jpeg_quality: int = 60,
+    ) -> JsonObject:
+        query_params = self._build_query(session_id=session_id)
+        query_params["height"] = str(int(height))
+        query_params["preserve_aspect_ratio"] = "true" if preserve_aspect_ratio else "false"
+        query_params["jpeg_quality"] = str(int(jpeg_quality))
+        return self._request("GET", "/capture/viewport", query=query_params, allow_http_error_json=True)
+
     def get_events(
         self,
         *,

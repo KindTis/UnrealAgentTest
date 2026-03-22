@@ -6,11 +6,20 @@ TERMINATION_MODES = ("keep_running", "close_game", "close_editor")
 SUPPORTED_DEFEAT_INTENT = "defeat_monster"
 SUPPORTED_MOVEMENT_INTENT = "movement_jump_sequence"
 SUPPORTED_WORKFLOW_INTENT = "workflow_steps"
-SUPPORTED_INTENTS = (SUPPORTED_DEFEAT_INTENT, SUPPORTED_MOVEMENT_INTENT, SUPPORTED_WORKFLOW_INTENT)
+SUPPORTED_VISION_NAVIGATION_INTENT = "vision_navigation"
+SUPPORTED_INTENTS = (
+    SUPPORTED_DEFEAT_INTENT,
+    SUPPORTED_MOVEMENT_INTENT,
+    SUPPORTED_WORKFLOW_INTENT,
+    SUPPORTED_VISION_NAVIGATION_INTENT,
+)
 SUPPORTED_SELECTOR_TYPE = "forward_cone"
 SUPPORTED_TARGET_KIND = "monster"
 SUPPORTED_MOVEMENT_COMPLETION_STATE = "sequence_completed"
 SUPPORTED_WORKFLOW_COMPLETION_STATE = "steps_completed"
+SUPPORTED_VISION_NAVIGATION_COMPLETION_STATE = "goal_reached"
+SUPPORTED_VISION_NAVIGATION_SUCCESS_MODES = ("position", "visual", "hybrid")
+SUPPORTED_VISION_NAVIGATION_DECISION_BRIDGE_MODE = "file"
 SUPPORTED_CONDITION_STATES = ("player_state", "target_state", "spatial_state", "success")
 SUPPORTED_CONDITION_OPERATORS = ("eq", "ne", "lt", "lte", "gt", "gte")
 SUPPORTED_WORKFLOW_ACTIONS = ("command", "wait", "move_phase", "move_to_location", "defeat_target")
@@ -18,6 +27,77 @@ SUPPORTED_WORKFLOW_ACTIONS = ("command", "wait", "move_phase", "move_to_location
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_non_empty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _validate_string_field(value: Any, errors: list[str], scope: str, *, field_name: str) -> None:
+    if value is not None and not _is_non_empty_string(value):
+        errors.append(f"{scope}.{field_name} must be a non-empty string when provided")
+
+
+def _validate_number_range(
+    value: Any,
+    errors: list[str],
+    scope: str,
+    *,
+    field_name: str,
+    minimum: float,
+    maximum: float,
+) -> None:
+    if not _is_number(value):
+        errors.append(f"{scope}.{field_name} must be a number")
+    elif not (minimum <= float(value) <= maximum):
+        errors.append(f"{scope}.{field_name} must be in [{minimum}, {maximum}]")
+
+
+def _validate_int_range(
+    value: Any,
+    errors: list[str],
+    scope: str,
+    *,
+    field_name: str,
+    minimum: int,
+    maximum: int,
+) -> None:
+    if not isinstance(value, int) or isinstance(value, bool):
+        errors.append(f"{scope}.{field_name} must be an integer")
+    elif not (minimum <= value <= maximum):
+        errors.append(f"{scope}.{field_name} must be in [{minimum}, {maximum}]")
+
+
+def _validate_alias_number_fields(
+    payload: Mapping[str, Any],
+    errors: list[str],
+    scope: str,
+    field_names: Sequence[str],
+    *,
+    minimum: float,
+    maximum: float,
+    integer: bool = False,
+    required: bool = False,
+) -> None:
+    present_field_names = [field_name for field_name in field_names if field_name in payload]
+    if not present_field_names:
+        if required:
+            errors.append(f"{scope}.{field_names[0]} is required")
+        return
+
+    value = payload[present_field_names[0]]
+    for field_name in present_field_names[1:]:
+        if payload[field_name] != value:
+            errors.append(
+                f"{scope}.{field_names[0]} and {scope}.{field_name} must match when both are provided"
+            )
+            break
+
+    field_name = present_field_names[0]
+    if integer:
+        _validate_int_range(value, errors, scope, field_name=field_name, minimum=int(minimum), maximum=int(maximum))
+    else:
+        _validate_number_range(value, errors, scope, field_name=field_name, minimum=minimum, maximum=maximum)
 
 
 def _validate_common_fields(scenario: Mapping[str, Any], errors: list[str]) -> None:
@@ -402,6 +482,300 @@ def _validate_workflow_steps_scenario(scenario: Mapping[str, Any], errors: list[
                     errors.append(f"{scope}.message must be a non-empty string when provided")
 
 
+def _validate_vision_navigation_goal(goal: Mapping[str, Any], errors: list[str]) -> None:
+    def require_keys(payload: Mapping[str, Any], keys: Sequence[str], scope: str) -> None:
+        for key in keys:
+            if key not in payload:
+                errors.append(f"{scope}.{key} is required")
+
+    if not isinstance(goal, Mapping):
+        errors.append("scenario.goal must be an object")
+        return
+
+    description = goal.get("description")
+    visual_target = goal.get("visual_target")
+    position_target = goal.get("position_target")
+
+    _validate_string_field(description, errors, "scenario.goal", field_name="description")
+    _validate_string_field(visual_target, errors, "scenario.goal", field_name="visual_target")
+
+    if position_target is not None:
+        if not isinstance(position_target, Mapping):
+            errors.append("scenario.goal.position_target must be an object when provided")
+        else:
+            require_keys(position_target, ("x", "y"), "scenario.goal.position_target")
+            _validate_number_range(
+                position_target.get("x"),
+                errors,
+                "scenario.goal.position_target",
+                field_name="x",
+                minimum=-100000.0,
+                maximum=100000.0,
+            )
+            _validate_number_range(
+                position_target.get("y"),
+                errors,
+                "scenario.goal.position_target",
+                field_name="y",
+                minimum=-100000.0,
+                maximum=100000.0,
+            )
+            if "z" in position_target:
+                z_value = position_target.get("z")
+                if z_value is not None:
+                    _validate_number_range(
+                        z_value,
+                        errors,
+                        "scenario.goal.position_target",
+                        field_name="z",
+                        minimum=-100000.0,
+                        maximum=100000.0,
+                    )
+            if "tolerance_cm" in position_target:
+                tolerance_cm = position_target.get("tolerance_cm")
+                if tolerance_cm is not None:
+                    _validate_number_range(
+                        tolerance_cm,
+                        errors,
+                        "scenario.goal.position_target",
+                        field_name="tolerance_cm",
+                        minimum=0.1,
+                        maximum=10000.0,
+                    )
+
+    if not any(
+        (
+            _is_non_empty_string(description),
+            _is_non_empty_string(visual_target),
+            position_target is not None,
+        )
+    ):
+        errors.append(
+            "scenario.goal must define at least one of description, visual_target, or position_target"
+        )
+
+
+def _validate_vision_navigation_success_criteria(
+    success_criteria: Mapping[str, Any],
+    goal: Mapping[str, Any],
+    errors: list[str],
+) -> None:
+    def require_keys(payload: Mapping[str, Any], keys: Sequence[str], scope: str) -> None:
+        for key in keys:
+            if key not in payload:
+                errors.append(f"{scope}.{key} is required")
+
+    if not isinstance(success_criteria, Mapping):
+        errors.append("scenario.success_criteria must be an object")
+        return
+
+    require_keys(success_criteria, ("timeout_seconds", "completion_state", "success_mode"), "scenario.success_criteria")
+
+    timeout_seconds = success_criteria.get("timeout_seconds")
+    _validate_number_range(
+        timeout_seconds,
+        errors,
+        "scenario.success_criteria",
+        field_name="timeout_seconds",
+        minimum=1.0,
+        maximum=3600.0,
+    )
+
+    if success_criteria.get("completion_state") != SUPPORTED_VISION_NAVIGATION_COMPLETION_STATE:
+        errors.append(
+            "scenario.success_criteria.completion_state must be goal_reached"
+        )
+
+    success_mode = success_criteria.get("success_mode")
+    if success_mode not in SUPPORTED_VISION_NAVIGATION_SUCCESS_MODES:
+        errors.append(
+            "scenario.success_criteria.success_mode must be one of position, visual, hybrid"
+        )
+    else:
+        position_target = goal.get("position_target") if isinstance(goal, Mapping) else None
+        if success_mode in {"position", "hybrid"}:
+            if position_target is None:
+                errors.append(
+                    f"scenario.goal.position_target is required when scenario.success_criteria.success_mode is {success_mode}"
+                )
+        elif position_target is not None:
+            errors.append(
+                "scenario.goal.position_target is only allowed when scenario.success_criteria.success_mode is position or hybrid"
+            )
+
+
+def _validate_vision_navigation_failure_criteria(failure_criteria: Mapping[str, Any], errors: list[str]) -> None:
+    def require_keys(payload: Mapping[str, Any], keys: Sequence[str], scope: str) -> None:
+        for key in keys:
+            if key not in payload:
+                errors.append(f"{scope}.{key} is required")
+
+    if not isinstance(failure_criteria, Mapping):
+        errors.append("scenario.failure_criteria must be an object")
+        return
+
+    require_keys(failure_criteria, ("input_failure_limit",), "scenario.failure_criteria")
+    _validate_int_range(
+        failure_criteria.get("input_failure_limit"),
+        errors,
+        "scenario.failure_criteria",
+        field_name="input_failure_limit",
+        minimum=1,
+        maximum=10,
+    )
+
+    if "capture_failure_limit" in failure_criteria:
+        _validate_int_range(
+            failure_criteria.get("capture_failure_limit"),
+            errors,
+            "scenario.failure_criteria",
+            field_name="capture_failure_limit",
+            minimum=0,
+            maximum=10,
+        )
+
+    if "decision_failure_limit" in failure_criteria:
+        _validate_int_range(
+            failure_criteria.get("decision_failure_limit"),
+            errors,
+            "scenario.failure_criteria",
+            field_name="decision_failure_limit",
+            minimum=0,
+            maximum=10,
+        )
+
+
+def _validate_vision_navigation_loop(loop: Mapping[str, Any], errors: list[str]) -> None:
+    def require_keys(payload: Mapping[str, Any], keys: Sequence[str], scope: str) -> None:
+        for key in keys:
+            if key not in payload:
+                errors.append(f"{scope}.{key} is required")
+
+    if not isinstance(loop, Mapping):
+        errors.append("scenario.loop must be an object")
+        return
+
+    require_keys(loop, ("max_iterations", "observe_interval_seconds"), "scenario.loop")
+
+    _validate_int_range(
+        loop.get("max_iterations"),
+        errors,
+        "scenario.loop",
+        field_name="max_iterations",
+        minimum=1,
+        maximum=200,
+    )
+    _validate_number_range(
+        loop.get("observe_interval_seconds"),
+        errors,
+        "scenario.loop",
+        field_name="observe_interval_seconds",
+        minimum=0.05,
+        maximum=5.0,
+    )
+
+    _validate_alias_number_fields(
+        loop,
+        errors,
+        "scenario.loop",
+        ("capture_timeout_seconds", "observe_timeout_seconds"),
+        minimum=0.5,
+        maximum=300.0,
+        required=True,
+    )
+    _validate_alias_number_fields(
+        loop,
+        errors,
+        "scenario.loop",
+        ("action_timeout_seconds", "act_timeout_seconds"),
+        minimum=0.5,
+        maximum=300.0,
+        required=True,
+    )
+
+    if "decision_timeout_seconds" in loop or "decide_timeout_seconds" in loop:
+        _validate_alias_number_fields(
+            loop,
+            errors,
+            "scenario.loop",
+            ("decision_timeout_seconds", "decide_timeout_seconds"),
+            minimum=0.5,
+            maximum=300.0,
+        )
+
+
+def _validate_vision_navigation_capture(capture: Mapping[str, Any], errors: list[str]) -> None:
+    def require_keys(payload: Mapping[str, Any], keys: Sequence[str], scope: str) -> None:
+        for key in keys:
+            if key not in payload:
+                errors.append(f"{scope}.{key} is required")
+
+    if not isinstance(capture, Mapping):
+        errors.append("scenario.capture must be an object")
+        return
+
+    require_keys(capture, ("height", "preserve_aspect_ratio", "jpeg_quality"), "scenario.capture")
+
+    _validate_int_range(
+        capture.get("height"),
+        errors,
+        "scenario.capture",
+        field_name="height",
+        minimum=64,
+        maximum=2160,
+    )
+    preserve_aspect_ratio = capture.get("preserve_aspect_ratio")
+    if not isinstance(preserve_aspect_ratio, bool):
+        errors.append("scenario.capture.preserve_aspect_ratio must be a boolean")
+    _validate_int_range(
+        capture.get("jpeg_quality"),
+        errors,
+        "scenario.capture",
+        field_name="jpeg_quality",
+        minimum=1,
+        maximum=100,
+    )
+
+
+def _validate_vision_navigation_decision_bridge(
+    decision_bridge: Mapping[str, Any],
+    errors: list[str],
+) -> None:
+    def require_keys(payload: Mapping[str, Any], keys: Sequence[str], scope: str) -> None:
+        for key in keys:
+            if key not in payload:
+                errors.append(f"{scope}.{key} is required")
+
+    if not isinstance(decision_bridge, Mapping):
+        errors.append("scenario.decision_bridge must be an object")
+        return
+
+    require_keys(decision_bridge, ("mode",), "scenario.decision_bridge")
+
+    if decision_bridge.get("mode") != SUPPORTED_VISION_NAVIGATION_DECISION_BRIDGE_MODE:
+        errors.append("scenario.decision_bridge.mode must be file")
+
+    _validate_alias_number_fields(
+        decision_bridge,
+        errors,
+        "scenario.decision_bridge",
+        ("decide_wait_timeout_seconds", "decision_timeout_seconds"),
+        minimum=0.5,
+        maximum=300.0,
+        required=True,
+    )
+    _validate_alias_number_fields(
+        decision_bridge,
+        errors,
+        "scenario.decision_bridge",
+        ("decide_retry_count", "decision_retry_count"),
+        minimum=0,
+        maximum=10,
+        integer=True,
+        required=True,
+    )
+
+
 def validate_scenario(scenario: Mapping[str, Any]) -> list[str]:
     errors: list[str] = []
 
@@ -435,5 +809,29 @@ def validate_scenario(scenario: Mapping[str, Any]) -> list[str]:
         _validate_movement_jump_sequence_scenario(scenario, errors)
     elif intent == SUPPORTED_WORKFLOW_INTENT:
         _validate_workflow_steps_scenario(scenario, errors)
+    elif intent == SUPPORTED_VISION_NAVIGATION_INTENT:
+        goal = scenario.get("goal")
+        _validate_vision_navigation_goal(goal, errors)
+        _validate_vision_navigation_success_criteria(
+            scenario.get("success_criteria"),
+            goal if isinstance(goal, Mapping) else {},
+            errors,
+        )
+        _validate_vision_navigation_failure_criteria(scenario.get("failure_criteria"), errors)
+
+        loop = scenario.get("loop")
+        _validate_vision_navigation_loop(loop, errors)
+
+        capture = scenario.get("capture")
+        if capture is not None:
+            _validate_vision_navigation_capture(capture, errors)
+        else:
+            errors.append("scenario.capture is required")
+
+        decision_bridge = scenario.get("decision_bridge")
+        if decision_bridge is not None:
+            _validate_vision_navigation_decision_bridge(decision_bridge, errors)
+        else:
+            errors.append("scenario.decision_bridge is required")
 
     return errors

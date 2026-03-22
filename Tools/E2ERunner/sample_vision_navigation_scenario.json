@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "source_text": "파란 표지판이 보이는 지점까지 이동하세요.",
+  "language": "ko",
+  "intent": "vision_navigation",
+  "goal": {
+    "description": "파란 표지판 근처 도착",
+    "visual_target": "파란 표지판",
+    "position_target": {
+      "x": 1234.5,
+      "y": -678.9,
+      "tolerance_cm": 75
+    }
+  },
+  "success_criteria": {
+    "timeout_seconds": 240,
+    "completion_state": "goal_reached",
+    "success_mode": "hybrid"
+  },
+  "failure_criteria": {
+    "input_failure_limit": 3,
+    "capture_failure_limit": 1
+  },
+  "loop": {
+    "max_iterations": 120,
+    "observe_interval_seconds": 0.7,
+    "capture_timeout_seconds": 2.0,
+    "action_timeout_seconds": 3.0
+  },
+  "capture": {
+    "height": 360,
+    "preserve_aspect_ratio": true,
+    "jpeg_quality": 60
+  },
+  "decision_bridge": {
+    "mode": "file",
+    "decide_wait_timeout_seconds": 30.0,
+    "decide_retry_count": 1
+  },
+  "termination": {
+    "mode": "keep_running"
+  }
+}

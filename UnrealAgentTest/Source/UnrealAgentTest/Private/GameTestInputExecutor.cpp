@@ -5,6 +5,7 @@
 #include "Dom/JsonObject.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
+#include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/PlatformProcess.h"
 #include "InputCoreTypes.h"
@@ -387,6 +388,43 @@ namespace
 		return true;
 	}
 
+	bool ExecuteCameraYaw(APlayerController* PlayerController, const TSharedPtr<FJsonObject>& NormalizedArgs, TSharedPtr<FJsonObject>& Details, FString& OutErrorMessage)
+	{
+		if (PlayerController == nullptr)
+		{
+			OutErrorMessage = TEXT("PlayerController is not available for camera_yaw.");
+			return false;
+		}
+
+		double Degrees = 0.0;
+		const bool bHasDegrees = TryReadNumberField(NormalizedArgs, TEXT("degrees"), Degrees)
+			|| TryReadNumberField(NormalizedArgs, TEXT("delta_degrees"), Degrees);
+		if (!bHasDegrees)
+		{
+			OutErrorMessage = TEXT("degrees or delta_degrees is missing from normalized_args.");
+			return false;
+		}
+
+		const FRotator BeforeRotation = PlayerController->GetControlRotation();
+		const float DeltaYaw = static_cast<float>(Degrees);
+		APawn* Pawn = PlayerController->GetPawn();
+		if (Pawn != nullptr)
+		{
+			Pawn->AddControllerYawInput(DeltaYaw);
+		}
+
+		FRotator AfterRotation = PlayerController->GetControlRotation();
+		AfterRotation.Yaw = FRotator::NormalizeAxis(AfterRotation.Yaw + DeltaYaw);
+		PlayerController->SetControlRotation(AfterRotation);
+
+		SetDetailsString(Details, TEXT("input_mode"), TEXT("camera_yaw"));
+		SetDetailsNumber(Details, TEXT("applied_degrees"), Degrees);
+		SetDetailsBool(Details, TEXT("used_pawn_add_controller_yaw_input"), Pawn != nullptr);
+		SetDetailsNumber(Details, TEXT("before_yaw"), BeforeRotation.Yaw);
+		SetDetailsNumber(Details, TEXT("after_yaw"), AfterRotation.Yaw);
+		return true;
+	}
+
 	bool ExecuteRecipe(APlayerController* PlayerController, const TSharedPtr<FJsonObject>& NormalizedArgs, TSharedPtr<FJsonObject>& Details, FString& OutErrorMessage)
 	{
 		if (PlayerController == nullptr)
@@ -445,6 +483,10 @@ FGameTestInputExecutionResult FGameTestInputExecutor::ExecuteCommand(const FGame
 		else if (CommandName == TEXT("execute_recipe"))
 		{
 			bExecuted = ExecuteRecipe(PlayerController, Request.NormalizedArgs, Result.Details, ExecutionError);
+		}
+		else if (CommandName == TEXT("camera_yaw"))
+		{
+			bExecuted = ExecuteCameraYaw(PlayerController, Request.NormalizedArgs, Result.Details, ExecutionError);
 		}
 		else
 		{
